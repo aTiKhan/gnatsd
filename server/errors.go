@@ -40,14 +40,17 @@ var (
 	// ErrReservedPublishSubject represents an error condition when sending to a reserved subject, e.g. _SYS.>
 	ErrReservedPublishSubject = errors.New("reserved internal subject")
 
-	// ErrBadClientProtocol signals a client requested an invalud client protocol.
+	// ErrBadPublishSubject represents an error condition for an invalid publish subject.
+	ErrBadPublishSubject = errors.New("invalid publish subject")
+
+	// ErrBadClientProtocol signals a client requested an invalid client protocol.
 	ErrBadClientProtocol = errors.New("invalid client protocol")
 
 	// ErrTooManyConnections signals a client that the maximum number of connections supported by the
 	// server has been reached.
 	ErrTooManyConnections = errors.New("maximum connections exceeded")
 
-	// ErrTooManyAccountConnections signals that an acount has reached its maximum number of active
+	// ErrTooManyAccountConnections signals that an account has reached its maximum number of active
 	// connections.
 	ErrTooManyAccountConnections = errors.New("maximum account active connections exceeded")
 
@@ -75,6 +78,15 @@ var (
 
 	// ErrMissingAccount is returned when an account does not exist.
 	ErrMissingAccount = errors.New("account missing")
+
+	// ErrMissingService is returned when an account does not have an exported service.
+	ErrMissingService = errors.New("service missing")
+
+	// ErrBadServiceType is returned when latency tracking is being applied to non-singleton response types.
+	ErrBadServiceType = errors.New("bad service response type")
+
+	// ErrBadSampling is returned when the sampling for latency tracking is not 1 >= sample <= 100.
+	ErrBadSampling = errors.New("bad sampling percentage, should be 1-100")
 
 	// ErrAccountValidation is returned when an account has failed validation.
 	ErrAccountValidation = errors.New("account validation failed")
@@ -109,6 +121,12 @@ var (
 	// ErrNoSysAccount is returned when an attempt to publish or subscribe is made
 	// when there is no internal system account defined.
 	ErrNoSysAccount = errors.New("system account not setup")
+
+	// ErrRevocation is returned when a credential has been revoked.
+	ErrRevocation = errors.New("credentials have been revoked")
+
+	// Used to signal an error that a server is not running.
+	ErrServerNotRunning = errors.New("server is not running")
 )
 
 // configErr is a configuration error.

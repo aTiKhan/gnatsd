@@ -1,4 +1,4 @@
-// Copyright 2012-2018 The NATS Authors
+// Copyright 2012-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/gnatsd/server"
+	"github.com/nats-io/nats-server/v2/server"
 )
 
 const (
@@ -186,4 +186,45 @@ func TestUnpromptedPong(t *testing.T) {
 	if ne, ok := err.(net.Error); ok && ne.Timeout() {
 		t.Fatal("timeout: Expected to have connection closed")
 	}
+}
+
+func TestPingSuppresion(t *testing.T) {
+	pingInterval := 100 * time.Millisecond
+	highWater := 130 * time.Millisecond
+	opts := DefaultTestOptions
+	opts.Port = PING_TEST_PORT
+	opts.PingInterval = pingInterval
+
+	s := RunServer(&opts)
+	defer s.Shutdown()
+
+	c := createClientConn(t, "127.0.0.1", PING_TEST_PORT)
+	defer c.Close()
+
+	connectTime := time.Now()
+
+	send, expect := setupConn(t, c)
+
+	expect(pingRe)
+	pingTime := time.Since(connectTime)
+	send("PONG\r\n")
+
+	// Should be > 100 but less then 120(ish)
+	if pingTime < pingInterval {
+		t.Fatalf("pingTime too low: %v", pingTime)
+	}
+	// +5 is just for fudging in case things are slow in the testing system.
+	if pingTime > highWater {
+		t.Fatalf("pingTime too high: %v", pingTime)
+	}
+
+	time.Sleep(pingInterval / 2)
+
+	// Sending a PING should suppress.
+	send("PING\r\n")
+	expect(pongRe)
+
+	// This will wait for the time period where a PING should have fired
+	// and been delivered. We expect nothing here since it should be suppressed.
+	expectNothingTimeout(t, c, time.Now().Add(100*time.Millisecond))
 }

@@ -1,4 +1,4 @@
-// Copyright 2018 The NATS Authors
+// Copyright 2018-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,6 +14,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -27,8 +28,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/gnatsd/logger"
-	"github.com/nats-io/go-nats"
+	"github.com/nats-io/nats-server/v2/logger"
+	"github.com/nats-io/nats.go"
 )
 
 func init() {
@@ -39,6 +40,9 @@ func init() {
 // Wait for the expected number of outbound gateways, or fails.
 func waitForOutboundGateways(t *testing.T, s *Server, expected int, timeout time.Duration) {
 	t.Helper()
+	if timeout < 2*time.Second {
+		timeout = 2 * time.Second
+	}
 	checkFor(t, timeout, 15*time.Millisecond, func() error {
 		if n := s.numOutboundGateways(); n != expected {
 			return fmt.Errorf("Expected %v outbound gateway(s), got %v", expected, n)
@@ -50,6 +54,9 @@ func waitForOutboundGateways(t *testing.T, s *Server, expected int, timeout time
 // Wait for the expected number of inbound gateways, or fails.
 func waitForInboundGateways(t *testing.T, s *Server, expected int, timeout time.Duration) {
 	t.Helper()
+	if timeout < 2*time.Second {
+		timeout = 2 * time.Second
+	}
 	checkFor(t, timeout, 15*time.Millisecond, func() error {
 		if n := s.numInboundGateways(); n != expected {
 			return fmt.Errorf("Expected %v inbound gateway(s), got %v", expected, n)
@@ -119,6 +126,22 @@ func checkForSubjectNoInterest(t *testing.T, c *client, account, subject string,
 	})
 }
 
+func checkForAccountNoInterest(t *testing.T, c *client, account string, expectedNoInterest bool, timeout time.Duration) {
+	t.Helper()
+	checkFor(t, timeout, 15*time.Millisecond, func() error {
+		ei, ok := c.gw.outsim.Load(account)
+		if !ok && expectedNoInterest {
+			return fmt.Errorf("No-interest for account %q not yet registered", account)
+		} else if ok && !expectedNoInterest {
+			return fmt.Errorf("Account %q should not have a no-interest", account)
+		}
+		if ei != nil {
+			return fmt.Errorf("Account %q should have a global no-interest, not subject no-interest", account)
+		}
+		return nil
+	})
+}
+
 func waitCh(t *testing.T, ch chan bool, errTxt string) {
 	t.Helper()
 	select {
@@ -154,6 +177,15 @@ func natsSubSync(t *testing.T, nc *nats.Conn, subj string) *nats.Subscription {
 		t.Fatalf("Error on subscribe: %v", err)
 	}
 	return sub
+}
+
+func natsNexMsg(t *testing.T, sub *nats.Subscription, timeout time.Duration) *nats.Msg {
+	t.Helper()
+	msg, err := sub.NextMsg(timeout)
+	if err != nil {
+		t.Fatalf("Failed getting next message: %v", err)
+	}
+	return msg
 }
 
 func natsQueueSub(t *testing.T, nc *nats.Conn, subj, queue string, cb nats.MsgHandler) *nats.Subscription {
@@ -321,13 +353,9 @@ func TestGatewayBasic(t *testing.T) {
 	s1.Shutdown()
 	// When s2 detects the connection is closed, it will attempt
 	// to reconnect once (even if the route is implicit).
-	// Wait a bit before restarting s1. For Windows, we need to wait
-	// more than the dialTimeout before restarting the server.
-	wait := 500 * time.Millisecond
-	if runtime.GOOS == "windows" {
-		wait = 1200 * time.Millisecond
-	}
-	time.Sleep(wait)
+	// We need to wait more than a dial timeout to make sure
+	// s1 does not restart too quickly and s2 can actually reconnect.
+	time.Sleep(DEFAULT_ROUTE_DIAL + 250*time.Millisecond)
 	// Restart s1 without gateway to B.
 	o1.Gateway.Gateways = nil
 	s1 = runGatewayServer(o1)
@@ -794,10 +822,10 @@ func TestGatewayTLS(t *testing.T) {
 	s1 = runGatewayServer(o1)
 	defer s1.Shutdown()
 
-	waitForOutboundGateways(t, s1, 1, time.Second)
-	waitForOutboundGateways(t, s2, 1, time.Second)
-	waitForInboundGateways(t, s1, 1, time.Second)
-	waitForInboundGateways(t, s2, 1, time.Second)
+	waitForOutboundGateways(t, s1, 1, 2*time.Second)
+	waitForOutboundGateways(t, s2, 1, 2*time.Second)
+	waitForInboundGateways(t, s1, 1, 2*time.Second)
+	waitForInboundGateways(t, s2, 1, 2*time.Second)
 
 	cfg = s1.getRemoteGateway("B")
 	cfg.RLock()
@@ -1427,6 +1455,7 @@ func TestGatewayAccountUnsub(t *testing.T) {
 	natsSub(t, ncb, "foo", func(m *nats.Msg) {
 		ncb.Publish(m.Reply, []byte("reply"))
 	})
+	natsFlush(t, ncb)
 
 	// Connect on A
 	nca := natsConnect(t, fmt.Sprintf("nats://%s:%d", oa.Host, oa.Port))
@@ -1446,6 +1475,12 @@ func TestGatewayAccountUnsub(t *testing.T) {
 	total := 5000
 	for i := 0; i < total; i++ {
 		natsPub(t, nca, "foo", []byte("hello"))
+		// Try to slow down things a bit to give a chance
+		// to srvB to send the A- and to srvA to be able
+		// to process it, which will then suppress the sends.
+		if i%100 == 0 {
+			natsFlush(t, nca)
+		}
 	}
 	natsFlush(t, nca)
 
@@ -2123,6 +2158,7 @@ func TestGatewaySendRemoteQSubs(t *testing.T) {
 	ob2 := testDefaultOptionsForGateway("B")
 	ob2.Routes = RoutesFromStr(fmt.Sprintf("nats://%s:%d", ob1.Cluster.Host, ob1.Cluster.Port))
 	sb2 := runGatewayServer(ob2)
+	defer sb2.Shutdown()
 
 	checkClusterFormed(t, sb1, sb2)
 
@@ -2438,8 +2474,8 @@ func TestGatewayComplexSetup(t *testing.T) {
 	}
 	natsFlush(t, ncsa1)
 
-	expectedLow := int(float32(total/2) * 0.7)
-	expectedHigh := int(float32(total/2) * 1.3)
+	expectedLow := int(float32(total/2) * 0.6)
+	expectedHigh := int(float32(total/2) * 1.4)
 	checkCount := func(t *testing.T, count *int32) {
 		t.Helper()
 		c := int(atomic.LoadInt32(count))
@@ -2549,10 +2585,7 @@ func TestGatewayMsgSentOnlyOnce(t *testing.T) {
 	if c == nil {
 		t.Fatalf("S1 inbound gateway not found")
 	}
-	c.mu.Lock()
-	in := c.inMsgs
-	c.mu.Unlock()
-	if in != 1 {
+	if in := atomic.LoadInt64(&c.inMsgs); in != 1 {
 		t.Fatalf("Expected s1's inbound gateway to have received a single message, got %v", in)
 	}
 }
@@ -3005,7 +3038,7 @@ func TestGatewaySendAllSubs(t *testing.T) {
 		var switchedMode bool
 		e := c.gw.insim[globalAccountName]
 		if e != nil {
-			switchedMode = e.ni == nil && e.mode == modeInterestOnly
+			switchedMode = e.ni == nil && e.mode == InterestOnly
 		}
 		c.mu.Unlock()
 		if !switchedMode {
@@ -3018,7 +3051,7 @@ func TestGatewaySendAllSubs(t *testing.T) {
 		if ei != nil {
 			e := ei.(*outsie)
 			e.RLock()
-			switchedMode = e.ni == nil && e.mode == modeInterestOnly
+			switchedMode = e.ni == nil && e.mode == InterestOnly
 			e.RUnlock()
 		}
 		if !switchedMode {
@@ -3131,7 +3164,7 @@ func TestGatewaySendAllSubsBadProtocol(t *testing.T) {
 	checkFor(t, 3*time.Second, 15*time.Millisecond, func() error {
 		c = getInboundGatewayConnection(sa, "A")
 		if c == nil {
-			t.Fatalf("Did not reconnect")
+			return fmt.Errorf("Did not reconnect")
 		}
 		return nil
 	})
@@ -3431,7 +3464,7 @@ func TestGatewayServiceImport(t *testing.T) {
 		outsie.RLock()
 		mode := outsie.mode
 		outsie.RUnlock()
-		if mode != modeInterestOnly {
+		if mode != InterestOnly {
 			return fmt.Errorf("Should have switched to interest only mode")
 		}
 		return nil
@@ -3662,6 +3695,7 @@ func TestGatewayServiceImportWithQueue(t *testing.T) {
 
 	subA = natsQueueSubSync(t, clientA, "test.request", "queue")
 	natsFlush(t, clientA)
+	checkForRegisteredQSubInterest(t, sb, "A", "$foo", "test.request", 1, time.Second)
 
 	// Send 100 requests from clientB on foo.request,
 	for i := 0; i < 100; i++ {
@@ -3672,7 +3706,7 @@ func TestGatewayServiceImportWithQueue(t *testing.T) {
 	// Consume the requests, but don't reply to them...
 	for i := 0; i < 100; i++ {
 		if _, err := subA.NextMsg(time.Second); err != nil {
-			t.Fatalf("subA did not receive request: %v", err)
+			t.Fatalf("subA did not receive request %d: %v", i+1, err)
 		}
 	}
 
@@ -3737,7 +3771,7 @@ func TestGatewayServiceImportWithQueue(t *testing.T) {
 		outsie.RLock()
 		mode := outsie.mode
 		outsie.RUnlock()
-		if mode != modeInterestOnly {
+		if mode != InterestOnly {
 			return fmt.Errorf("Should have switched to interest only mode")
 		}
 		return nil
@@ -4078,7 +4112,7 @@ func TestGatewayServiceImportComplexSetup(t *testing.T) {
 		outsie.RLock()
 		mode := outsie.mode
 		outsie.RUnlock()
-		if mode != modeInterestOnly {
+		if mode != InterestOnly {
 			return fmt.Errorf("Not in interest-only mode yet")
 		}
 		return nil
@@ -4202,7 +4236,21 @@ func TestGatewayServiceExportWithWildcards(t *testing.T) {
 			setAccountUserPassInOptions(oa2, "$foo", "clientA", "password")
 			setAccountUserPassInOptions(oa2, "$bar", "yyyyyyy", "password")
 			oa2.gatewaysSolicitDelay = time.Nanosecond // 0 would be default, so nano to connect asap
-			sa2 := runGatewayServer(oa2)
+			var sa2 *Server
+			sb2ID := sb2.ID()
+			for i := 0; i < 10; i++ {
+				sa2 = runGatewayServer(oa2)
+				ogc := sa2.getOutboundGatewayConnection("B")
+				if ogc != nil {
+					ogc.mu.Lock()
+					ok := ogc.opts.Name == sb2ID
+					ogc.mu.Unlock()
+					if ok {
+						break
+					}
+				}
+				sa2.Shutdown()
+			}
 			defer sa2.Shutdown()
 
 			checkClusterFormed(t, sa1, sa2)
@@ -4405,12 +4453,14 @@ func TestGatewayServiceExportWithWildcards(t *testing.T) {
 			clientB2 := natsConnect(t, b2URL)
 			defer clientB2.Close()
 			natsSubSync(t, clientB2, "not.used")
+			natsFlush(t, clientB2)
 
 			// Make A2 flood B2 with subjects that B2 is not interested in.
 			for i := 0; i < 1100; i++ {
 				natsPub(t, clientA, fmt.Sprintf("no.interest.%d", i), []byte("hello"))
 			}
 			natsFlush(t, clientA)
+
 			// Wait for B2 to switch to interest-only
 			checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
 				c := sa2.getOutboundGatewayConnection("B")
@@ -4425,7 +4475,7 @@ func TestGatewayServiceExportWithWildcards(t *testing.T) {
 				outsie.RLock()
 				mode := outsie.mode
 				outsie.RUnlock()
-				if mode != modeInterestOnly {
+				if mode != InterestOnly {
 					return fmt.Errorf("Not in interest-only mode yet")
 				}
 				return nil
@@ -4584,5 +4634,328 @@ func TestGatewayMapReplyOnlyForRecentSub(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatalf("Did not get replies")
+	}
+}
+
+func TestGatewayNoAccInterestThenQSubThenRegularSub(t *testing.T) {
+	ob := testDefaultOptionsForGateway("B")
+	sb := runGatewayServer(ob)
+	defer sb.Shutdown()
+
+	oa := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
+	sa := runGatewayServer(oa)
+	defer sa.Shutdown()
+
+	waitForOutboundGateways(t, sa, 1, time.Second)
+	waitForInboundGateways(t, sa, 1, time.Second)
+	waitForOutboundGateways(t, sb, 1, time.Second)
+	waitForInboundGateways(t, sb, 1, time.Second)
+
+	// Connect on A and send a message
+	ncA := natsConnect(t, fmt.Sprintf("nats://%s:%d", oa.Host, oa.Port))
+	defer ncA.Close()
+	natsPub(t, ncA, "foo", []byte("hello"))
+	natsFlush(t, ncA)
+
+	// expect an A- on return
+	gwb := sa.getOutboundGatewayConnection("B")
+	checkForAccountNoInterest(t, gwb, globalAccountName, true, time.Second)
+
+	// Create a connection o B, and create a queue sub first
+	ncB := natsConnect(t, fmt.Sprintf("nats://%s:%d", ob.Host, ob.Port))
+	defer ncB.Close()
+	qsub := natsQueueSubSync(t, ncB, "bar", "queue")
+	natsFlush(t, ncB)
+
+	// A should have received a queue interest
+	checkForRegisteredQSubInterest(t, sa, "B", globalAccountName, "bar", 1, time.Second)
+
+	// Now on B, create a regular sub
+	sub := natsSubSync(t, ncB, "baz")
+	natsFlush(t, ncB)
+
+	// From A now, produce a message on each subject and
+	// expect both subs to receive their message.
+	msgForQSub := []byte("msg_qsub")
+	natsPub(t, ncA, "bar", msgForQSub)
+	natsFlush(t, ncA)
+
+	if msg := natsNexMsg(t, qsub, time.Second); !bytes.Equal(msgForQSub, msg.Data) {
+		t.Fatalf("Expected msg for queue sub to be %q, got %q", msgForQSub, msg.Data)
+	}
+
+	// Publish for the regular sub
+	msgForSub := []byte("msg_sub")
+	natsPub(t, ncA, "baz", msgForSub)
+	natsFlush(t, ncA)
+
+	if msg := natsNexMsg(t, sub, time.Second); !bytes.Equal(msgForSub, msg.Data) {
+		t.Fatalf("Expected msg for sub to be %q, got %q", msgForSub, msg.Data)
+	}
+}
+
+// Similar to TestGatewayNoAccInterestThenQSubThenRegularSub but simulate
+// older incorrect behavior.
+func TestGatewayHandleUnexpectedASubUnsub(t *testing.T) {
+	ob := testDefaultOptionsForGateway("B")
+	sb := runGatewayServer(ob)
+	defer sb.Shutdown()
+
+	oa := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
+	sa := runGatewayServer(oa)
+	defer sa.Shutdown()
+
+	waitForOutboundGateways(t, sa, 1, time.Second)
+	waitForInboundGateways(t, sa, 1, time.Second)
+	waitForOutboundGateways(t, sb, 1, time.Second)
+	waitForInboundGateways(t, sb, 1, time.Second)
+
+	// Connect on A and send a message
+	ncA := natsConnect(t, fmt.Sprintf("nats://%s:%d", oa.Host, oa.Port))
+	defer ncA.Close()
+	natsPub(t, ncA, "foo", []byte("hello"))
+	natsFlush(t, ncA)
+
+	// expect an A- on return
+	gwb := sa.getOutboundGatewayConnection("B")
+	checkForAccountNoInterest(t, gwb, globalAccountName, true, time.Second)
+
+	// Create a connection o B, and create a queue sub first
+	ncB := natsConnect(t, fmt.Sprintf("nats://%s:%d", ob.Host, ob.Port))
+	defer ncB.Close()
+	qsub := natsQueueSubSync(t, ncB, "bar", "queue")
+	natsFlush(t, ncB)
+
+	// A should have received a queue interest
+	checkForRegisteredQSubInterest(t, sa, "B", globalAccountName, "bar", 1, time.Second)
+
+	// Now on B, create a regular sub
+	sub := natsSubSync(t, ncB, "baz")
+	natsFlush(t, ncB)
+	// and reproduce old, wrong, behavior that would have resulted in sending an A-
+	gwA := getInboundGatewayConnection(sb, "A")
+	gwA.mu.Lock()
+	gwA.sendProto([]byte("A- $G\r\n"), true)
+	gwA.mu.Unlock()
+
+	// From A now, produce a message on each subject and
+	// expect both subs to receive their message.
+	msgForQSub := []byte("msg_qsub")
+	natsPub(t, ncA, "bar", msgForQSub)
+	natsFlush(t, ncA)
+
+	if msg := natsNexMsg(t, qsub, time.Second); !bytes.Equal(msgForQSub, msg.Data) {
+		t.Fatalf("Expected msg for queue sub to be %q, got %q", msgForQSub, msg.Data)
+	}
+
+	// Publish for the regular sub
+	msgForSub := []byte("msg_sub")
+	natsPub(t, ncA, "baz", msgForSub)
+	natsFlush(t, ncA)
+
+	if msg := natsNexMsg(t, sub, time.Second); !bytes.Equal(msgForSub, msg.Data) {
+		t.Fatalf("Expected msg for sub to be %q, got %q", msgForSub, msg.Data)
+	}
+
+	// Remove all subs on B.
+	qsub.Unsubscribe()
+	sub.Unsubscribe()
+	ncB.Flush()
+
+	// Produce a message from A expect A-
+	natsPub(t, ncA, "foo", []byte("hello"))
+	natsFlush(t, ncA)
+
+	// expect an A- on return
+	checkForAccountNoInterest(t, gwb, globalAccountName, true, time.Second)
+
+	// Simulate B sending another A-, on A account no interest should remain same.
+	gwA.mu.Lock()
+	gwA.sendProto([]byte("A- $G\r\n"), true)
+	gwA.mu.Unlock()
+
+	checkForAccountNoInterest(t, gwb, globalAccountName, true, time.Second)
+
+	// Create a queue sub on B
+	qsub = natsQueueSubSync(t, ncB, "bar", "queue")
+	natsFlush(t, ncB)
+
+	checkForRegisteredQSubInterest(t, sa, "B", globalAccountName, "bar", 1, time.Second)
+
+	// Make B send an A+ and verify that we sitll have the registered qsub interest
+	gwA.mu.Lock()
+	gwA.sendProto([]byte("A+ $G\r\n"), true)
+	gwA.mu.Unlock()
+
+	// Give a chance to A to possibly misbehave when receiving this proto
+	time.Sleep(250 * time.Millisecond)
+	// Now check interest is still there
+	checkForRegisteredQSubInterest(t, sa, "B", globalAccountName, "bar", 1, time.Second)
+
+	qsub.Unsubscribe()
+	natsFlush(t, ncB)
+	checkForRegisteredQSubInterest(t, sa, "B", globalAccountName, "bar", 0, time.Second)
+
+	// Send A-, server A should set entry to nil
+	gwA.mu.Lock()
+	gwA.sendProto([]byte("A- $G\r\n"), true)
+	gwA.mu.Unlock()
+	checkForAccountNoInterest(t, gwb, globalAccountName, true, time.Second)
+
+	// Send A+ and entry should be removed since there is no longer reason to
+	// keep the entry.
+	gwA.mu.Lock()
+	gwA.sendProto([]byte("A+ $G\r\n"), true)
+	gwA.mu.Unlock()
+	checkForAccountNoInterest(t, gwb, globalAccountName, false, time.Second)
+
+	// Last A+ should not change because account already removed from map.
+	gwA.mu.Lock()
+	gwA.sendProto([]byte("A+ $G\r\n"), true)
+	gwA.mu.Unlock()
+	checkForAccountNoInterest(t, gwb, globalAccountName, false, time.Second)
+}
+
+type captureGWInterestSwitchLogger struct {
+	DummyLogger
+	imss []string
+}
+
+func (l *captureGWInterestSwitchLogger) Noticef(format string, args ...interface{}) {
+	l.Lock()
+	msg := fmt.Sprintf(format, args...)
+	if strings.Contains(msg, fmt.Sprintf("switching account %q to %s mode", globalAccountName, InterestOnly)) ||
+		strings.Contains(msg, fmt.Sprintf("switching account %q to %s mode complete", globalAccountName, InterestOnly)) {
+		l.imss = append(l.imss, msg)
+	}
+	l.Unlock()
+}
+
+func TestGatewayLogAccountInterestModeSwitch(t *testing.T) {
+	ob := testDefaultOptionsForGateway("B")
+	sb := runGatewayServer(ob)
+	defer sb.Shutdown()
+
+	logB := &captureGWInterestSwitchLogger{}
+	sb.SetLogger(logB, true, true)
+
+	oa := testGatewayOptionsFromToWithServers(t, "A", "B", sb)
+	sa := runGatewayServer(oa)
+	defer sa.Shutdown()
+
+	logA := &captureGWInterestSwitchLogger{}
+	sa.SetLogger(logA, true, true)
+
+	waitForOutboundGateways(t, sa, 1, 2*time.Second)
+	waitForInboundGateways(t, sa, 1, 2*time.Second)
+	waitForOutboundGateways(t, sb, 1, 2*time.Second)
+	waitForInboundGateways(t, sb, 1, 2*time.Second)
+
+	ncB := natsConnect(t, fmt.Sprintf("nats://127.0.0.1:%d", ob.Port))
+	defer ncB.Close()
+	natsSubSync(t, ncB, "foo")
+	natsFlush(t, ncB)
+
+	ncA := natsConnect(t, fmt.Sprintf("nats://127.0.0.1:%d", oa.Port))
+	defer ncA.Close()
+	for i := 0; i < gatewayMaxRUnsubBeforeSwitch+10; i++ {
+		subj := fmt.Sprintf("bar.%d", i)
+		natsPub(t, ncA, subj, []byte("hello"))
+	}
+	natsFlush(t, ncA)
+
+	gwA := getInboundGatewayConnection(sb, "A")
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		mode := Optimistic
+		gwA.mu.Lock()
+		e := gwA.gw.insim[globalAccountName]
+		if e != nil {
+			mode = e.mode
+		}
+		gwA.mu.Unlock()
+		if mode != InterestOnly {
+			return fmt.Errorf("not switched yet")
+		}
+		return nil
+	})
+
+	gwB := sa.getOutboundGatewayConnection("B")
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		ei, ok := gwB.gw.outsim.Load(globalAccountName)
+		if !ok || ei == nil {
+			return fmt.Errorf("not switched yet")
+		}
+		e := ei.(*outsie)
+		e.RLock()
+		mode := e.mode
+		e.RUnlock()
+		if mode != InterestOnly {
+			return fmt.Errorf("not in interest mode only yet")
+		}
+		return nil
+	})
+
+	checkLog := func(t *testing.T, l *captureGWInterestSwitchLogger) {
+		t.Helper()
+		l.Lock()
+		logs := append([]string(nil), l.imss...)
+		l.Unlock()
+
+		if len(logs) != 2 {
+			t.Fatalf("Expected 2 logs about switching to interest-only, got %v", logs)
+		}
+		if !strings.Contains(logs[0], "switching account") {
+			t.Fatalf("First log statement should have been about switching, got %v", logs[0])
+		}
+		if !strings.Contains(logs[1], "complete") {
+			t.Fatalf("Second log statement should have been about having switched, got %v", logs[1])
+		}
+	}
+	checkLog(t, logB)
+	checkLog(t, logA)
+
+	// Clear log of server B
+	logB.Lock()
+	logB.imss = nil
+	logB.Unlock()
+
+	// Force a switch on B to inbound gateway from A and make sure that it is
+	// a no-op since this gateway connection has already been switched.
+	sb.switchAccountToInterestMode(globalAccountName)
+
+	logB.Lock()
+	didSwitch := len(logB.imss) > 0
+	logB.Unlock()
+	if didSwitch {
+		t.Fatalf("Attempted to switch while it was already in interest mode only")
+	}
+}
+
+func TestGatewaySingleOutbound(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Error on listen: %v", err)
+	}
+	defer l.Close()
+	port := l.Addr().(*net.TCPAddr).Port
+
+	o1 := testGatewayOptionsFromToWithTLS(t, "A", "B", []string{fmt.Sprintf("nats://127.0.0.1:%d", port)})
+	o1.Gateway.TLSTimeout = 0.1
+	s1 := runGatewayServer(o1)
+	defer s1.Shutdown()
+
+	buf := make([]byte, 10000)
+	// Check for a little bit that we don't have the situation
+	timeout := time.Now().Add(2 * time.Second)
+	for time.Now().Before(timeout) {
+		n := runtime.Stack(buf, true)
+		index := strings.Index(string(buf[:n]), "reconnectGateway")
+		if index != -1 {
+			newIndex := strings.LastIndex(string(buf[:n]), "reconnectGateway")
+			if newIndex > index {
+				t.Fatalf("Trying to reconnect twice for the same outbound!")
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
 	}
 }

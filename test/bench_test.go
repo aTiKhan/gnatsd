@@ -1,4 +1,4 @@
-// Copyright 2012-2018 The NATS Authors
+// Copyright 2012-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -28,7 +28,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/gnatsd/server"
+	"github.com/nats-io/nats-server/v2/server"
 )
 
 const PERF_PORT = 8422
@@ -993,7 +993,7 @@ func gatewaysBench(b *testing.B, optimisticMode bool, payload string, numPublish
 	}
 	oa := testDefaultOptionsForGateway("A")
 	oa.Gateway.Gateways = []*server.RemoteGatewayOpts{
-		&server.RemoteGatewayOpts{
+		{
 			Name: "B",
 			URLs: []*url.URL{gwbURL},
 		},
@@ -1214,7 +1214,7 @@ func gatewaySendRequestsBench(b *testing.B, singleReplySub bool) {
 	}
 	oa := testDefaultOptionsForGateway("A")
 	oa.Gateway.Gateways = []*server.RemoteGatewayOpts{
-		&server.RemoteGatewayOpts{
+		{
 			Name: "B",
 			URLs: []*url.URL{gwbURL},
 		},
@@ -1381,6 +1381,14 @@ func Benchmark___________RoutedInterestGraph(b *testing.B) {
 	unsubLoop := func(route *rh, ch chan bool, index int) {
 		bw := bufio.NewWriterSize(route.r, defaultSendBufSize)
 		account := fmt.Sprintf("$foo.account.%d", index)
+
+		// Wait for seed server's first PING so that it does
+		// not interfere with the expected PONG after sending
+		// all RS- and last PING.
+		// The wait here does not affect perf measurements
+		// since we do so *before* we signal that we are ready.
+		route.expect(pingRe)
+		route.send("PONG\r\n")
 
 		// Signal we are ready
 		close(ch)

@@ -17,18 +17,43 @@ package jwt
 
 import (
 	"errors"
+	"fmt"
+	"net/url"
+	"strings"
 
 	"github.com/nats-io/nkeys"
 )
 
 // Operator specific claims
 type Operator struct {
-	Identities  []Identity `json:"identity,omitempty"`
+	// Slice of real identies (like websites) that can be used to identify the operator.
+	Identities []Identity `json:"identity,omitempty"`
+	// Slice of other operator NKeys that can be used to sign on behalf of the main
+	// operator identity.
 	SigningKeys StringList `json:"signing_keys,omitempty"`
+	// AccountServerURL is a partial URL like "https://host.domain.org:<port>/jwt/v1"
+	// tools will use the prefix and build queries by appending /accounts/<account_id>
+	// or /operator to the path provided. Note this assumes that the account server
+	// can handle requests in a nats-account-server compatible way. See
+	// https://github.com/nats-io/nats-account-server.
+	AccountServerURL string `json:"account_server_url,omitempty"`
+	// A list of NATS urls (tls://host:port) where tools can connect to the server
+	// using proper credentials.
+	OperatorServiceURLs StringList `json:"operator_service_urls,omitempty"`
 }
 
 // Validate checks the validity of the operators contents
 func (o *Operator) Validate(vr *ValidationResults) {
+	if err := o.validateAccountServerURL(); err != nil {
+		vr.AddError(err.Error())
+	}
+
+	for _, v := range o.validateOperatorServiceURLs() {
+		if v != nil {
+			vr.AddError(v.Error())
+		}
+	}
+
 	for _, i := range o.Identities {
 		i.Validate(vr)
 	}
@@ -38,6 +63,64 @@ func (o *Operator) Validate(vr *ValidationResults) {
 			vr.AddError("%s is not an operator public key", k)
 		}
 	}
+}
+
+func (o *Operator) validateAccountServerURL() error {
+	if o.AccountServerURL != "" {
+		// We don't care what kind of URL it is so long as it parses
+		// and has a protocol. The account server may impose additional
+		// constraints on the type of URLs that it is able to notify to
+		u, err := url.Parse(o.AccountServerURL)
+		if err != nil {
+			return fmt.Errorf("error parsing account server url: %v", err)
+		}
+		if u.Scheme == "" {
+			return fmt.Errorf("account server url %q requires a protocol", o.AccountServerURL)
+		}
+	}
+	return nil
+}
+
+// ValidateOperatorServiceURL returns an error if the URL is not a valid NATS or TLS url.
+func ValidateOperatorServiceURL(v string) error {
+	// should be possible for the service url to not be expressed
+	if v == "" {
+		return nil
+	}
+	u, err := url.Parse(v)
+	if err != nil {
+		return fmt.Errorf("error parsing operator service url %q: %v", v, err)
+	}
+
+	if u.User != nil {
+		return fmt.Errorf("operator service url %q - credentials are not supported", v)
+	}
+
+	if u.Path != "" {
+		return fmt.Errorf("operator service url %q - paths are not supported", v)
+	}
+
+	lcs := strings.ToLower(u.Scheme)
+	switch lcs {
+	case "nats":
+		return nil
+	case "tls":
+		return nil
+	default:
+		return fmt.Errorf("operator service url %q - protocol not supported (only 'nats' or 'tls' only)", v)
+	}
+}
+
+func (o *Operator) validateOperatorServiceURLs() []error {
+	var errors []error
+	for _, v := range o.OperatorServiceURLs {
+		if v != "" {
+			if err := ValidateOperatorServiceURL(v); err != nil {
+				errors = append(errors, err)
+			}
+		}
+	}
+	return errors
 }
 
 // OperatorClaims define the data for an operator JWT
@@ -68,7 +151,7 @@ func (oc *OperatorClaims) DidSign(op Claims) bool {
 	return oc.SigningKeys.Contains(issuer)
 }
 
-// deprecated AddSigningKey, use claim.SigningKeys.Add()
+// Deprecated: AddSigningKey, use claim.SigningKeys.Add()
 func (oc *OperatorClaims) AddSigningKey(pk string) {
 	oc.SigningKeys.Add(pk)
 }
@@ -78,8 +161,12 @@ func (oc *OperatorClaims) Encode(pair nkeys.KeyPair) (string, error) {
 	if !nkeys.IsValidPublicOperatorKey(oc.Subject) {
 		return "", errors.New("expected subject to be an operator public key")
 	}
+	err := oc.validateAccountServerURL()
+	if err != nil {
+		return "", err
+	}
 	oc.ClaimsData.Type = OperatorClaim
-	return oc.ClaimsData.encode(pair, oc)
+	return oc.ClaimsData.Encode(pair, oc)
 }
 
 // DecodeOperatorClaims tries to create an operator claims from a JWt string

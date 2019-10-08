@@ -1,4 +1,4 @@
-// Copyright 2018 The NATS Authors
+// Copyright 2018-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -22,11 +22,12 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/nats-io/go-nats"
 	"github.com/nats-io/jwt"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
 )
 
@@ -306,6 +307,166 @@ func TestSystemAccountNewConnection(t *testing.T) {
 	}
 }
 
+func runTrustedLeafServer(t *testing.T) (*Server, *Options) {
+	t.Helper()
+	opts := DefaultOptions()
+	kp, _ := nkeys.FromSeed(oSeed)
+	pub, _ := kp.PublicKey()
+	opts.TrustedKeys = []string{pub}
+	opts.AccountResolver = &MemAccResolver{}
+	opts.LeafNode.Port = -1
+	s := RunServer(opts)
+	return s, opts
+}
+
+func genCredsFile(t *testing.T, jwt string, seed []byte) string {
+	creds := `
+		-----BEGIN NATS USER JWT-----
+		%s
+		------END NATS USER JWT------
+
+		************************* IMPORTANT *************************
+		NKEY Seed printed below can be used to sign and prove identity.
+		NKEYs are sensitive and should be treated as secrets.
+
+		-----BEGIN USER NKEY SEED-----
+		%s
+		------END USER NKEY SEED------
+
+		*************************************************************
+		`
+	return createConfFile(t, []byte(strings.Replace(fmt.Sprintf(creds, jwt, seed), "\t\t", "", -1)))
+}
+
+func runSolicitWithCredentials(t *testing.T, opts *Options, creds string) (*Server, *Options, string) {
+	content := `
+		port: -1
+		leafnodes {
+			remotes = [
+				{
+					url: nats-leaf://127.0.0.1:%d
+					credentials: "%s"
+				}
+			]
+		}
+		`
+	config := fmt.Sprintf(content, opts.LeafNode.Port, creds)
+	conf := createConfFile(t, []byte(config))
+	s, opts := RunServerWithConfig(conf)
+	return s, opts, conf
+}
+
+// Helper function to check that a leaf node has connected to our server.
+func checkLeafNodeConnected(t *testing.T, s *Server) {
+	t.Helper()
+	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+		if nln := s.NumLeafNodes(); nln != 1 {
+			return fmt.Errorf("Expected a connected leafnode for server %q, got none", s.ID())
+		}
+		return nil
+	})
+}
+
+func TestSystemAccountingWithLeafNodes(t *testing.T) {
+	s, opts := runTrustedLeafServer(t)
+	defer s.Shutdown()
+
+	acc, akp := createAccount(s)
+	s.setSystemAccount(acc)
+
+	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
+	ncs, err := nats.Connect(url, createUserCreds(t, s, akp))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer ncs.Close()
+
+	acc2, akp2 := createAccount(s)
+
+	// Be explicit to only receive the event for global account.
+	sub, _ := ncs.SubscribeSync(fmt.Sprintf("$SYS.ACCOUNT.%s.DISCONNECT", acc2.Name))
+	defer sub.Unsubscribe()
+	ncs.Flush()
+
+	kp, _ := nkeys.CreateUser()
+	pub, _ := kp.PublicKey()
+	nuc := jwt.NewUserClaims(pub)
+	ujwt, err := nuc.Encode(akp2)
+	if err != nil {
+		t.Fatalf("Error generating user JWT: %v", err)
+	}
+	seed, _ := kp.Seed()
+	mycreds := genCredsFile(t, ujwt, seed)
+	defer os.Remove(mycreds)
+
+	// Create a server that solicits a leafnode connection.
+	sl, slopts, lnconf := runSolicitWithCredentials(t, opts, mycreds)
+	defer os.Remove(lnconf)
+	defer sl.Shutdown()
+
+	checkLeafNodeConnected(t, s)
+
+	nc, err := nats.Connect(url, createUserCreds(t, s, akp2), nats.Name("TEST LEAFNODE EVENTS"))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc.Close()
+	nc.SubscribeSync("foo")
+	nc.Flush()
+
+	surl := fmt.Sprintf("nats://%s:%d", slopts.Host, slopts.Port)
+	nc2, err := nats.Connect(surl, nats.Name("TEST LEAFNODE EVENTS"))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc2.Close()
+
+	m := []byte("HELLO WORLD")
+
+	// Now generate some traffic
+	nc2.SubscribeSync("*")
+	for i := 0; i < 10; i++ {
+		nc2.Publish("foo", m)
+		nc2.Publish("bar", m)
+	}
+	nc2.Flush()
+
+	// Now send some from the cluster side too.
+	for i := 0; i < 10; i++ {
+		nc.Publish("foo", m)
+		nc.Publish("bar", m)
+	}
+	nc.Flush()
+
+	// Now shutdown the leafnode server since this is where the event tracking should
+	// happen. Right now we do not track local clients to the leafnode server that
+	// solicited to the cluster, but we should track usage once the leafnode connection stops.
+	sl.Shutdown()
+
+	// Make sure we get disconnect event and that tracking is correct.
+	msg, err := sub.NextMsg(time.Second)
+	if err != nil {
+		t.Fatalf("Error receiving msg: %v", err)
+	}
+
+	dem := DisconnectEventMsg{}
+	if err := json.Unmarshal(msg.Data, &dem); err != nil {
+		t.Fatalf("Error unmarshalling disconnect event message: %v", err)
+	}
+	if dem.Sent.Msgs != 10 {
+		t.Fatalf("Expected 10 msgs sent, got %d", dem.Sent.Msgs)
+	}
+	if dem.Sent.Bytes != 110 {
+		t.Fatalf("Expected 110 bytes sent, got %d", dem.Sent.Bytes)
+	}
+	if dem.Received.Msgs != 20 {
+		t.Fatalf("Expected 20 msgs received, got %d", dem.Sent.Msgs)
+	}
+	if dem.Received.Bytes != 220 {
+		t.Fatalf("Expected 220 bytes sent, got %d", dem.Sent.Bytes)
+	}
+}
+
 func TestSystemAccountDisconnectBadLogin(t *testing.T) {
 	s, opts := runTrustedServer(t)
 	defer s.Shutdown()
@@ -377,7 +538,7 @@ func TestSystemAccountInternalSubscriptions(t *testing.T) {
 
 	received := make(chan *nats.Msg)
 	// Create message callback handler.
-	cb := func(sub *subscription, subject, reply string, msg []byte) {
+	cb := func(sub *subscription, _ *client, subject, reply string, msg []byte) {
 		copy := append([]byte(nil), msg...)
 		received <- &nats.Msg{Subject: subject, Reply: reply, Data: copy}
 	}
@@ -451,7 +612,7 @@ func TestSystemAccountConnectionUpdatesStopAfterNoLocal(t *testing.T) {
 
 	// Listen for updates to the new account connection activity.
 	received := make(chan *nats.Msg, 10)
-	cb := func(sub *subscription, subject, reply string, msg []byte) {
+	cb := func(sub *subscription, _ *client, subject, reply string, msg []byte) {
 		copy := append([]byte(nil), msg...)
 		received <- &nats.Msg{Subject: subject, Reply: reply, Data: copy}
 	}
@@ -486,9 +647,9 @@ func TestSystemAccountConnectionUpdatesStopAfterNoLocal(t *testing.T) {
 	acc, _ := sb.LookupAccount(pub)
 	// Make sure we have the timer running.
 	acc.mu.RLock()
-	etmr := acc.etmr
+	ctmr := acc.ctmr
 	acc.mu.RUnlock()
-	if etmr == nil {
+	if ctmr == nil {
 		t.Fatalf("Expected event timer for acc conns to be running")
 	}
 
@@ -497,9 +658,9 @@ func TestSystemAccountConnectionUpdatesStopAfterNoLocal(t *testing.T) {
 		nc.Close()
 	}
 
-	// Wait for all 4 notifications.
+	// Wait for the 4 new notifications, 8 total (4 for connect, 4 for disconnect)
 	checkFor(t, time.Second, 50*time.Millisecond, func() error {
-		if len(received) == 4 {
+		if len(received) == 8 {
 			return nil
 		}
 		return fmt.Errorf("Not enough messages, %d vs 4", len(received))
@@ -528,9 +689,9 @@ func TestSystemAccountConnectionUpdatesStopAfterNoLocal(t *testing.T) {
 
 	// Make sure we have the timer is NOT running.
 	acc.mu.RLock()
-	etmr = acc.etmr
+	ctmr = acc.ctmr
 	acc.mu.RUnlock()
-	if etmr != nil {
+	if ctmr != nil {
 		t.Fatalf("Expected event timer for acc conns to NOT be running after reaching zero local clients")
 	}
 }
@@ -667,7 +828,7 @@ func TestSystemAccountConnectionLimitsServersStaggered(t *testing.T) {
 	}
 
 	// Restart server B.
-	optsB.AccountResolver = sa.accResolver
+	optsB.AccountResolver = sa.AccountResolver()
 	optsB.SystemAccount = sa.systemAccount().Name
 	sb = RunServer(optsB)
 	defer sb.Shutdown()
@@ -676,7 +837,12 @@ func TestSystemAccountConnectionLimitsServersStaggered(t *testing.T) {
 	// Trigger a load of the user account on the new server
 	// NOTE: If we do not load the user, the user can be the first
 	// to request this account, hence the connection will succeed.
-	sb.LookupAccount(pub)
+	checkFor(t, time.Second, 15*time.Millisecond, func() error {
+		if acc, err := sb.LookupAccount(pub); acc == nil || err != nil {
+			return fmt.Errorf("LookupAccount did not return account or failed, err=%v", err)
+		}
+		return nil
+	})
 
 	// Expect this to fail.
 	urlB := fmt.Sprintf("nats://%s:%d", optsB.Host, optsB.Port)
@@ -1006,9 +1172,10 @@ func TestSystemAccountWithGateways(t *testing.T) {
 	sub, _ := nca.SubscribeSync("$SYS.ACCOUNT.>")
 	defer sub.Unsubscribe()
 	nca.Flush()
+
 	// If this tests fails with wrong number after 10 seconds we may have
 	// added a new inititial subscription for the eventing system.
-	checkExpectedSubs(t, 9, sa)
+	checkExpectedSubs(t, 13, sa)
 
 	// Create a client on B and see if we receive the event
 	urlb := fmt.Sprintf("nats://%s:%d", ob.Host, ob.Port)
@@ -1242,10 +1409,8 @@ func TestFetchAccountRace(t *testing.T) {
 
 	// Replace B's account resolver with one that introduces
 	// delay during the Fetch()
-	sb.mu.Lock()
-	sac := &slowAccResolver{AccountResolver: sb.accResolver}
-	sb.accResolver = sac
-	sb.mu.Unlock()
+	sac := &slowAccResolver{AccountResolver: sb.AccountResolver()}
+	sb.SetAccountResolver(sac)
 
 	// Add the account in sa and sb
 	addAccountToMemResolver(sa, userAcc, jwt)
@@ -1298,4 +1463,70 @@ func TestFetchAccountRace(t *testing.T) {
 	if !ok {
 		t.Fatalf("B should be able to receive messages")
 	}
+}
+
+func TestConnectionUpdatesTimerProperlySet(t *testing.T) {
+	origEventsHBInterval := eventsHBInterval
+	eventsHBInterval = 50 * time.Millisecond
+	defer func() { eventsHBInterval = origEventsHBInterval }()
+
+	sa, _, sb, optsB, _ := runTrustedCluster(t)
+	defer sa.Shutdown()
+	defer sb.Shutdown()
+
+	// Normal Account
+	okp, _ := nkeys.FromSeed(oSeed)
+	akp, _ := nkeys.CreateAccount()
+	pub, _ := akp.PublicKey()
+	nac := jwt.NewAccountClaims(pub)
+	nac.Limits.Conn = 10 // set any limit...
+	jwt, _ := nac.Encode(okp)
+
+	addAccountToMemResolver(sa, pub, jwt)
+
+	// Listen for HB updates...
+	count := int32(0)
+	cb := func(sub *subscription, _ *client, subject, reply string, msg []byte) {
+		atomic.AddInt32(&count, 1)
+	}
+	subj := fmt.Sprintf(accConnsEventSubj, pub)
+	sub, err := sa.sysSubscribe(subj, cb)
+	if sub == nil || err != nil {
+		t.Fatalf("Expected to subscribe, got %v", err)
+	}
+	defer sa.sysUnsubscribe(sub)
+
+	url := fmt.Sprintf("nats://%s:%d", optsB.Host, optsB.Port)
+	nc := natsConnect(t, url, createUserCreds(t, sb, akp))
+	defer nc.Close()
+
+	time.Sleep(500 * time.Millisecond)
+	// After waiting 500ms with HB interval of 50ms, we should get
+	// about 10 updates, no much more
+	if n := atomic.LoadInt32(&count); n > 15 {
+		t.Fatalf("Expected about 10 updates, got %v", n)
+	}
+
+	// Now lookup the account doing the events on sb.
+	acc, _ := sb.LookupAccount(pub)
+	// Make sure we have the timer running.
+	acc.mu.RLock()
+	ctmr := acc.ctmr
+	acc.mu.RUnlock()
+	if ctmr == nil {
+		t.Fatalf("Expected event timer for acc conns to be running")
+	}
+
+	nc.Close()
+
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		// Make sure we have the timer is NOT running.
+		acc.mu.RLock()
+		ctmr = acc.ctmr
+		acc.mu.RUnlock()
+		if ctmr != nil {
+			return fmt.Errorf("Expected event timer for acc conns to NOT be running after reaching zero local clients")
+		}
+		return nil
+	})
 }

@@ -1,4 +1,4 @@
-// Copyright 2018 The NATS Authors
+// Copyright 2018-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -21,7 +21,7 @@ import (
 	"regexp"
 	"testing"
 
-	"github.com/nats-io/gnatsd/server"
+	"github.com/nats-io/nats-server/v2/server"
 )
 
 func testDefaultOptionsForGateway(name string) *server.Options {
@@ -149,7 +149,7 @@ func TestGatewaySubjectInterest(t *testing.T) {
 	ob := testDefaultOptionsForGateway("B")
 	fooAcc := server.NewAccount("$foo")
 	ob.Accounts = []*server.Account{fooAcc}
-	ob.Users = []*server.User{&server.User{Username: "ivan", Password: "password", Account: fooAcc}}
+	ob.Users = []*server.User{{Username: "ivan", Password: "password", Account: fooAcc}}
 	sb := runGatewayServer(ob)
 	defer sb.Shutdown()
 
@@ -291,7 +291,7 @@ func TestGatewayQueue(t *testing.T) {
 	ob := testDefaultOptionsForGateway("B")
 	fooAcc := server.NewAccount("$foo")
 	ob.Accounts = []*server.Account{fooAcc}
-	ob.Users = []*server.User{&server.User{Username: "ivan", Password: "password", Account: fooAcc}}
+	ob.Users = []*server.User{{Username: "ivan", Password: "password", Account: fooAcc}}
 	sb := runGatewayServer(ob)
 	defer sb.Shutdown()
 
@@ -414,9 +414,9 @@ func TestGatewaySendAllSubs(t *testing.T) {
 	// Bombard B with messages on different subjects.
 	// TODO(ik): Adapt if/when we change the conditions for the
 	// switch.
-	for i := 0; i < 10001; i++ {
+	for i := 0; i < 1010; i++ {
 		gASend(fmt.Sprintf("RMSG $G foo.%d 2\r\nok\r\n", i))
-		if i <= 1000 {
+		if i < 1000 {
 			gAExpect(runsubRe)
 		}
 	}
@@ -445,4 +445,74 @@ func TestGatewaySendAllSubs(t *testing.T) {
 	gAExpect(rsubRe)
 	clientSend("UNSUB 1\r\n")
 	gAExpect(runsubRe)
+}
+
+func TestGatewayNoPanicOnBadProtocol(t *testing.T) {
+	ob := testDefaultOptionsForGateway("B")
+	sb := runGatewayServer(ob)
+	defer sb.Shutdown()
+
+	for _, test := range []struct {
+		name  string
+		proto string
+	}{
+		{"sub", "SUB > 1\r\n"},
+		{"unsub", "UNSUB 1\r\n"},
+		{"rsub", "RS+ $foo foo 2\r\n"},
+		{"runsub", "RS- $foo foo 2\r\n"},
+		{"pub", "PUB foo 2\r\nok\r\n"},
+		{"msg", "MSG foo 2\r\nok\r\n"},
+		{"rmsg", "RMSG $foo foo 2\r\nok\r\n"},
+		{"anything", "xxxx\r\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// Create raw tcp connection to gateway port
+			client := createClientConn(t, ob.Gateway.Host, ob.Gateway.Port)
+			defer client.Close()
+			clientSend := sendCommand(t, client)
+			clientSend(test.proto)
+		})
+	}
+
+	// Server should not have crashed.
+	client := createClientConn(t, ob.Host, ob.Port)
+	defer client.Close()
+	clientSend, clientExpect := setupConn(t, client)
+	clientSend("PING\r\n")
+	clientExpect(pongRe)
+}
+
+func TestGatewayNoAccUnsubAfterQSub(t *testing.T) {
+	ob := testDefaultOptionsForGateway("B")
+	sb := runGatewayServer(ob)
+	defer sb.Shutdown()
+
+	gA := createGatewayConn(t, ob.Gateway.Host, ob.Gateway.Port)
+	defer gA.Close()
+
+	gASend, gAExpect := setupGatewayConn(t, gA, "A", "B")
+	gASend("PING\r\n")
+	gAExpect(pongRe)
+
+	// Simulate a client connecting to A and publishing a message
+	// so we get an A- from B since there is no interest.
+	gASend("RMSG $G foo 2\r\nok\r\n")
+	gAExpect(aunsubRe)
+
+	// Now create client on B and create queue sub.
+	client := createClientConn(t, ob.Host, ob.Port)
+	defer client.Close()
+	clientSend, clientExpect := setupConn(t, client)
+
+	clientSend("SUB bar queue 1\r\nPING\r\n")
+	clientExpect(pongRe)
+
+	// A should receive an RS+ for this queue sub.
+	gAExpect(rsubRe)
+
+	// On B, create a plain sub now. We should get nothing.
+	clientSend("SUB baz 2\r\nPING\r\n")
+	clientExpect(pongRe)
+
+	expectNothing(t, gA)
 }

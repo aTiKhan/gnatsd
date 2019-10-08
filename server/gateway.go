@@ -46,6 +46,9 @@ var (
 	gatewaySolicitDelay          = int64(defaultSolicitGatewaysDelay)
 )
 
+// Warning when user configures gateway TLS insecure
+const gatewayTLSInsecureWarning = "TLS certificate chain and hostname of solicited gateways will not be verified. DO NOT USE IN PRODUCTION!"
+
 // SetGatewaysSolicitDelay sets the initial delay before gateways
 // connections are initiated.
 // Used by tests.
@@ -66,22 +69,38 @@ const (
 	gatewayCmdAllSubsComplete byte = 3
 )
 
-// Gateway modes
+// GatewayInterestMode represents an account interest mode for a gateway connection
+type GatewayInterestMode byte
+
+// GatewayInterestMode values
 const (
-	// modeOptimistic is the default mode where a cluster will send
+	// optimistic is the default mode where a cluster will send
 	// to a gateway unless it is been told that there is no interest
 	// (this is for plain subscribers only).
-	modeOptimistic = byte(iota)
-	// modeTransitioning is when a gateway has to send too many
+	Optimistic GatewayInterestMode = iota
+	// transitioning is when a gateway has to send too many
 	// no interest on subjects to the remote and decides that it is
 	// now time to move to modeInterestOnly (this is on a per account
 	// basis).
-	modeTransitioning
-	// modeInterestOnly means that a cluster sends all it subscriptions
+	Transitioning
+	// interestOnly means that a cluster sends all it subscriptions
 	// interest to the gateway, which in return does not send a message
 	// unless it knows that there is explicit interest.
-	modeInterestOnly
+	InterestOnly
 )
+
+func (im GatewayInterestMode) String() string {
+	switch im {
+	case Optimistic:
+		return "Optimistic"
+	case InterestOnly:
+		return "Interest-Only"
+	case Transitioning:
+		return "Transitioning"
+	default:
+		return "Unknown"
+	}
+}
 
 type srvGateway struct {
 	totalQSubs int64 //total number of queue subs in all remote gateways (used with atomic operations)
@@ -133,11 +152,12 @@ type sitally struct {
 type gatewayCfg struct {
 	sync.RWMutex
 	*RemoteGatewayOpts
-	replyPfx     []byte
-	urls         map[string]*url.URL
-	connAttempts int
-	implicit     bool
-	tlsName      string
+	replyPfx       []byte
+	urls           map[string]*url.URL
+	connAttempts   int
+	tlsName        string
+	implicit       bool
+	varzUpdateURLs bool // Tells monitoring code to update URLs when varz is inspected.
 }
 
 // Struct for client's gateway related fields
@@ -149,6 +169,9 @@ type gateway struct {
 	infoJSON   []byte            // Needed when sending INFO after receiving INFO from remote
 	outsim     *sync.Map         // Per-account subject interest (or no-interest) (outbound conn)
 	insim      map[string]*insie // Per-account subject no-interest sent or modeInterestOnly mode (inbound conn)
+
+	// Set/check in readLoop without lock. This is to know that an inbound has sent the CONNECT protocol first
+	connected bool
 }
 
 // Outbound subject interest entry.
@@ -157,7 +180,7 @@ type outsie struct {
 	// Indicate that all subs should be stored. This is
 	// set to true when receiving the command from the
 	// remote that we are about to receive all its subs.
-	mode byte
+	mode GatewayInterestMode
 	// If not nil, used for no-interest for plain subs.
 	// If a subject is present in this map, it means that
 	// the remote is not interested in that subject.
@@ -181,7 +204,7 @@ type outsie struct {
 // when all subs have been sent, mode is set to modeInterestOnly
 type insie struct {
 	ni   map[string]struct{} // Record if RS- was sent for given subject
-	mode byte                // modeOptimistic or modeInterestOnly
+	mode GatewayInterestMode
 }
 
 // clone returns a deep copy of the RemoteGatewayOpts object
@@ -211,18 +234,12 @@ func validateGatewayOptions(o *Options) error {
 	if o.Gateway.Port == 0 {
 		return fmt.Errorf("gateway %q has no port specified (select -1 for random port)", o.Gateway.Name)
 	}
-	if o.Gateway.TLSConfig != nil && o.Gateway.TLSConfig.InsecureSkipVerify {
-		return fmt.Errorf("tls InsecureSkipVerify not supported for gateway")
-	}
 	for i, g := range o.Gateway.Gateways {
 		if g.Name == "" {
 			return fmt.Errorf("gateway in the list %d has no name", i)
 		}
 		if len(g.URLs) == 0 {
 			return fmt.Errorf("gateway %q has no URL", g.Name)
-		}
-		if g.TLSConfig != nil && g.TLSConfig.InsecureSkipVerify {
-			return fmt.Errorf("tls InsecureSkipVerify not supported for remote gateway %q", g.Name)
 		}
 	}
 	return nil
@@ -414,6 +431,22 @@ func (s *Server) gatewayAcceptLoop(ch chan struct{}) {
 	}
 	// Setup state that can enable shutdown
 	s.gatewayListener = l
+
+	// Warn if insecure is configured in the main Gateway configuration
+	// or any of the RemoteGateway's. This means that we need to check
+	// remotes even if TLS would not be configured for the accept.
+	warn := tlsReq && opts.Gateway.TLSConfig.InsecureSkipVerify
+	if !warn {
+		for _, g := range opts.Gateway.Gateways {
+			if g.TLSConfig != nil && g.TLSConfig.InsecureSkipVerify {
+				warn = true
+				break
+			}
+		}
+	}
+	if warn {
+		s.Warnf(gatewayTLSInsecureWarning)
+	}
 	s.mu.Unlock()
 
 	// Let them know we are up
@@ -517,7 +550,7 @@ func (s *Server) solicitGateways() {
 		if !cfg.isImplicit() {
 			cfg := cfg // Create new instance for the goroutine.
 			s.startGoRoutine(func() {
-				s.solicitGateway(cfg)
+				s.solicitGateway(cfg, true)
 				s.grWG.Done()
 			})
 		}
@@ -538,12 +571,12 @@ func (s *Server) reconnectGateway(cfg *gatewayCfg) {
 	case <-s.quitCh:
 		return
 	}
-	s.solicitGateway(cfg)
+	s.solicitGateway(cfg, false)
 }
 
 // This function will loop trying to connect to any URL attached
 // to the given Gateway. It will return once a connection has been created.
-func (s *Server) solicitGateway(cfg *gatewayCfg) {
+func (s *Server) solicitGateway(cfg *gatewayCfg, firstConnect bool) {
 	var (
 		opts       = s.getOpts()
 		isImplicit = cfg.isImplicit()
@@ -556,7 +589,13 @@ func (s *Server) solicitGateway(cfg *gatewayCfg) {
 	} else {
 		typeStr = "explicit"
 	}
+
+	const connFmt = "Connecting to %s gateway %q (%s) at %s (attempt %v)"
+	const connErrFmt = "Error connecting to %s gateway %q (%s) at %s (attempt %v): %v"
+
 	for s.isRunning() && len(urls) > 0 {
+		attempts++
+		report := s.shouldReportConnectErr(firstConnect, attempts)
 		// Iteration is random
 		for _, u := range urls {
 			address, err := s.getRandomIP(s.gateway.resolver, u.Host)
@@ -564,21 +603,28 @@ func (s *Server) solicitGateway(cfg *gatewayCfg) {
 				s.Errorf("Error getting IP for %s gateway %q (%s): %v", typeStr, cfg.Name, u.Host, err)
 				continue
 			}
-			s.Noticef("Connecting to %s gateway %q (%s) at %s", typeStr, cfg.Name, u.Host, address)
+			if report {
+				s.Noticef(connFmt, typeStr, cfg.Name, u.Host, address, attempts)
+			} else {
+				s.Debugf(connFmt, typeStr, cfg.Name, u.Host, address, attempts)
+			}
 			conn, err := net.DialTimeout("tcp", address, DEFAULT_ROUTE_DIAL)
 			if err == nil {
 				// We could connect, create the gateway connection and return.
 				s.createGateway(cfg, u, conn)
 				return
 			}
-			s.Errorf("Error connecting to %s gateway %q (%s) at %s: %v", typeStr, cfg.Name, u.Host, address, err)
+			if report {
+				s.Errorf(connErrFmt, typeStr, cfg.Name, u.Host, address, attempts, err)
+			} else {
+				s.Debugf(connErrFmt, typeStr, cfg.Name, u.Host, address, attempts, err)
+			}
 			// Break this loop if server is being shutdown...
 			if !s.isRunning() {
 				break
 			}
 		}
 		if isImplicit {
-			attempts++
 			if opts.Gateway.ConnectRetries == 0 || attempts > opts.Gateway.ConnectRetries {
 				s.gateway.Lock()
 				delete(s.gateway.remotes, cfg.Name)
@@ -602,7 +648,8 @@ func (s *Server) createGateway(cfg *gatewayCfg, url *url.URL, conn net.Conn) {
 	// Snapshot server options.
 	opts := s.getOpts()
 
-	c := &client{srv: s, nc: conn, kind: GATEWAY}
+	now := time.Now()
+	c := &client{srv: s, nc: conn, start: now, last: now, kind: GATEWAY}
 
 	// Are we creating the gateway based on the configuration
 	solicit := cfg != nil
@@ -735,7 +782,7 @@ func (s *Server) createGateway(cfg *gatewayCfg, url *url.URL, conn net.Conn) {
 	}
 
 	// Set the Ping timer after sending connect and info.
-	c.setPingTimer()
+	s.setFirstPingTimer(c)
 
 	c.mu.Unlock()
 }
@@ -797,6 +844,15 @@ func (c *client) processGatewayConnect(arg []byte) error {
 		c.closeConnection(WrongGateway)
 		return ErrWrongGateway
 	}
+
+	// For a gateway connection, c.gw is guaranteed not to be nil here
+	// (created in createGateway() and never set to nil).
+	// For inbound connections, it is important to know in the parser
+	// if the CONNECT was received first, so we use this boolean (as
+	// opposed to client.flags that require locking) to indicate that
+	// CONNECT was processed. Again, this boolean is set/read in the
+	// readLoop without locking.
+	c.gw.connected = true
 
 	return nil
 }
@@ -897,10 +953,23 @@ func (c *client) processGatewayInfo(info *Info) {
 
 			// Register as an outbound gateway.. if we had a protocol to ack our connect,
 			// then we should do that when process that ack.
-			s.registerOutboundGatewayConnection(gwName, c)
-			c.Noticef("Outbound gateway connection to %q (%s) registered", gwName, info.ID)
-			// Now that the outbound gateway is registered, we can remove from temp map.
-			s.removeFromTempClients(cid)
+			if s.registerOutboundGatewayConnection(gwName, c) {
+				c.Noticef("Outbound gateway connection to %q (%s) registered", gwName, info.ID)
+				// Now that the outbound gateway is registered, we can remove from temp map.
+				s.removeFromTempClients(cid)
+			} else {
+				// There was a bug that would cause a connection to possibly
+				// be called twice resulting in reconnection of twice the
+				// same outbound connection. The issue is fixed, but adding
+				// defensive code above that if we did not register this connection
+				// because we already have an outbound for this name, then
+				// close this connection (and make sure it does not try to reconnect)
+				c.mu.Lock()
+				c.flags.set(noReconnect)
+				c.mu.Unlock()
+				c.closeConnection(WrongGateway)
+				return
+			}
 		} else if info.GatewayCmd > 0 {
 			switch info.GatewayCmd {
 			case gatewayCmdAllSubsStart:
@@ -1059,7 +1128,7 @@ func (s *Server) sendSubsToGateway(c *client, accountName []byte) {
 			e = &insie{}
 			c.gw.insim[string(accountName)] = e
 		}
-		e.mode = modeInterestOnly
+		e.mode = InterestOnly
 		c.mu.Unlock()
 	} else {
 		// Send queues for all accounts
@@ -1220,7 +1289,7 @@ func (s *Server) processImplicitGateway(info *Info) {
 	}
 	s.gateway.remotes[gwName] = cfg
 	s.startGoRoutine(func() {
-		s.solicitGateway(cfg)
+		s.solicitGateway(cfg, true)
 		s.grWG.Done()
 	})
 }
@@ -1293,6 +1362,10 @@ func (g *gatewayCfg) getURLs() []*url.URL {
 		a = append(a, u)
 	}
 	g.RUnlock()
+	// Map iteration is random, but not that good with small maps.
+	rand.Shuffle(len(a), func(i, j int) {
+		a[i], a[j] = a[j], a[i]
+	})
 	return a
 }
 
@@ -1352,6 +1425,8 @@ func (g *gatewayCfg) addURLs(infoURLs []string) {
 				g.saveTLSHostname(u)
 				// Use u.Host for the key.
 				g.urls[u.Host] = u
+				// Signal that we have updated the list. Used by monitoring code.
+				g.varzUpdateURLs = true
 			}
 		}
 	}
@@ -1414,12 +1489,17 @@ func (s *Server) registerInboundGatewayConnection(cid uint64, gwc *client) {
 
 // Register the given gateway connection (*client) in the outbound gateways
 // map with the given name as the key.
-func (s *Server) registerOutboundGatewayConnection(name string, gwc *client) {
+func (s *Server) registerOutboundGatewayConnection(name string, gwc *client) bool {
 	s.gateway.Lock()
+	if _, exist := s.gateway.out[name]; exist {
+		s.gateway.Unlock()
+		return false
+	}
 	s.gateway.out[name] = gwc
 	s.gateway.outo = append(s.gateway.outo, gwc)
 	s.gateway.orderOutboundConnectionsLocked()
 	s.gateway.Unlock()
+	return true
 }
 
 // Returns the outbound gateway connection (*client) with the given name,
@@ -1550,7 +1630,27 @@ func (s *Server) GatewayAddr() *net.TCPAddr {
 func (c *client) processGatewayAccountUnsub(accName string) {
 	// Just to indicate activity around "subscriptions" events.
 	c.in.subs++
-	c.gw.outsim.Store(accName, nil)
+	// This account may have an entry because of queue subs.
+	// If that's the case, we can reset the no-interest map,
+	// but not set the entry to nil.
+	setToNil := true
+	if ei, ok := c.gw.outsim.Load(accName); ei != nil {
+		e := ei.(*outsie)
+		e.Lock()
+		// Reset the no-interest map if we have queue subs
+		// and don't set the entry to nil.
+		if e.qsubs > 0 {
+			e.ni = make(map[string]struct{})
+			setToNil = false
+		}
+		e.Unlock()
+	} else if ok {
+		// Already set to nil, so skip
+		setToNil = false
+	}
+	if setToNil {
+		c.gw.outsim.Store(accName, nil)
+	}
 }
 
 // A+ protocol received from remote gateway if it had previously
@@ -1559,7 +1659,23 @@ func (c *client) processGatewayAccountUnsub(accName string) {
 func (c *client) processGatewayAccountSub(accName string) error {
 	// Just to indicate activity around "subscriptions" events.
 	c.in.subs++
-	c.gw.outsim.Delete(accName)
+	// If this account has an entry because of queue subs, we
+	// can't delete the entry.
+	remove := true
+	if ei, ok := c.gw.outsim.Load(accName); ei != nil {
+		e := ei.(*outsie)
+		e.Lock()
+		if e.qsubs > 0 {
+			remove = false
+		}
+		e.Unlock()
+	} else if !ok {
+		// There is no entry, so skip
+		remove = false
+	}
+	if remove {
+		c.gw.outsim.Delete(accName)
+	}
 	return nil
 }
 
@@ -1603,14 +1719,14 @@ func (c *client) processGatewayRUnsub(arg []byte) error {
 		defer e.Unlock()
 		// If there is an entry, for plain sub we need
 		// to know if we should store the sub
-		useSl = queue != nil || e.mode != modeOptimistic
+		useSl = queue != nil || e.mode != Optimistic
 	} else if queue != nil {
 		// should not even happen...
 		c.Debugf("Received RS- without prior RS+ for subject %q, queue %q", subject, queue)
 		return nil
 	} else {
 		// Plain sub, assume optimistic sends, create entry.
-		e = &outsie{ni: make(map[string]struct{}), sl: NewSublist()}
+		e = &outsie{ni: make(map[string]struct{}), sl: NewSublistWithCache()}
 		newe = true
 	}
 	// This is when a sub or queue sub is supposed to be in
@@ -1633,7 +1749,7 @@ func (c *client) processGatewayRUnsub(arg []byte) error {
 			// If last, we can remove the whole entry only
 			// when in optimistic mode and there is no element
 			// in the `ni` map.
-			if e.sl.Count() == 0 && e.mode == modeOptimistic && len(e.ni) == 0 {
+			if e.sl.Count() == 0 && e.mode == Optimistic && len(e.ni) == 0 {
 				c.gw.outsim.Delete(accName)
 			}
 		}
@@ -1707,11 +1823,11 @@ func (c *client) processGatewayRSub(arg []byte) error {
 		e = ei.(*outsie)
 		e.Lock()
 		defer e.Unlock()
-		useSl = queue != nil || e.mode != modeOptimistic
+		useSl = queue != nil || e.mode != Optimistic
 	} else if queue == nil {
 		return nil
 	} else {
-		e = &outsie{ni: make(map[string]struct{}), sl: NewSublist()}
+		e = &outsie{ni: make(map[string]struct{}), sl: NewSublistWithCache()}
 		newe = true
 		useSl = true
 	}
@@ -1835,7 +1951,10 @@ func (s *Server) switchAccountToInterestMode(accName string) {
 			e = &insie{}
 			gin.gw.insim[accName] = e
 		}
-		gin.gatewaySwitchAccountToSendAllSubs(e, []byte(accName))
+		// Do it only if we are in Optimistic mode
+		if e.mode == Optimistic {
+			gin.gatewaySwitchAccountToSendAllSubs(e, accName)
+		}
 		gin.mu.Unlock()
 	}
 }
@@ -1887,7 +2006,7 @@ func (s *Server) maybeSendSubOrUnsubToGateways(accName string, sub *subscription
 					delete(e.ni, subject)
 					sendProto = true
 				}
-			} else if e.mode == modeInterestOnly {
+			} else if e.mode == InterestOnly {
 				// We are in the mode where we always send RS+/- protocols.
 				sendProto = true
 			}
@@ -1976,6 +2095,15 @@ func (s *Server) sendQueueSubOrUnsubToGateways(accName string, qsub *subscriptio
 			proto = append(proto, CR_LF...)
 		}
 		c.mu.Lock()
+		// If we add a queue sub, and we had previously sent an A-,
+		// we don't need to send an A+ here, but we need to clear
+		// the fact that we did sent the A- so that we don't send
+		// an A+ when we will get the first non-queue sub registered.
+		if added {
+			if ei, ok := c.gw.insim[accName]; ok && ei == nil {
+				delete(c.gw.insim, accName)
+			}
+		}
 		c.sendProto(proto, false)
 		if c.trace {
 			c.traceOutOp("", proto[:len(proto)-LEN_CR_LF])
@@ -2133,7 +2261,7 @@ func (c *client) sendMsgToGateways(acc *Account, msg, subject, reply []byte, qgr
 		mreplya    [256]byte
 		mreply     []byte
 		dstPfx     []byte
-		checkReply = reply != nil
+		checkReply = len(reply) > 0
 	)
 
 	// Get a subscription from the pool
@@ -2228,7 +2356,7 @@ func (c *client) sendMsgToGateways(acc *Account, msg, subject, reply []byte, qgr
 		sub.nm, sub.max = 0, 0
 		sub.client = gwc
 		sub.subject = c.pa.subject
-		c.deliverMsg(sub, mh, msg)
+		c.deliverMsg(sub, c.pa.subject, mh, msg)
 	}
 	// Done with subscription, put back to pool. We don't need
 	// to reset content since we explicitly set when using it.
@@ -2339,9 +2467,9 @@ func (s *Server) gatewayHandleSubjectNoInterest(c *client, acc *Account, accName
 			if _, alreadySent := e.ni[string(subject)]; !alreadySent {
 				// TODO(ik): pick some threshold as to when
 				// we need to switch mode
-				if len(e.ni) > gatewayMaxRUnsubBeforeSwitch {
+				if len(e.ni) >= gatewayMaxRUnsubBeforeSwitch {
 					// If too many RS-, switch to all-subs-mode.
-					c.gatewaySwitchAccountToSendAllSubs(e, accName)
+					c.gatewaySwitchAccountToSendAllSubs(e, string(accName))
 				} else {
 					e.ni[string(subject)] = struct{}{}
 					sendProto = true
@@ -2481,6 +2609,10 @@ func (c *client) gatewayAllSubsReceiveStart(info *Info) {
 	if account == "" {
 		return
 	}
+
+	c.Noticef("Gateway %q: switching account %q to %s mode",
+		info.Gateway, account, InterestOnly)
+
 	// Since the remote would send us this start command
 	// only after sending us too many RS- for this account,
 	// we should always have an entry here.
@@ -2490,11 +2622,11 @@ func (c *client) gatewayAllSubsReceiveStart(info *Info) {
 	if ei != nil {
 		e := ei.(*outsie)
 		e.Lock()
-		e.mode = modeTransitioning
+		e.mode = Transitioning
 		e.Unlock()
 	} else {
-		e := &outsie{sl: NewSublist()}
-		e.mode = modeTransitioning
+		e := &outsie{sl: NewSublistWithCache()}
+		e.mode = Transitioning
 		c.mu.Lock()
 		c.gw.outsim.Store(account, e)
 		c.mu.Unlock()
@@ -2520,8 +2652,11 @@ func (c *client) gatewayAllSubsReceiveComplete(info *Info) {
 		// many go-routines calling gatewayInterest()
 		e.Lock()
 		e.ni = nil
-		e.mode = modeInterestOnly
+		e.mode = InterestOnly
 		e.Unlock()
+
+		c.Noticef("Gateway %q: switching account %q to %s mode complete",
+			info.Gateway, account, InterestOnly)
 	}
 }
 
@@ -2546,13 +2681,15 @@ func getAccountFromGatewayCommand(c *client, info *Info, cmd string) string {
 // sent.
 // The client's lock is held on entry.
 // <Invoked from inbound connection's readLoop>
-func (c *client) gatewaySwitchAccountToSendAllSubs(e *insie, accName []byte) {
+func (c *client) gatewaySwitchAccountToSendAllSubs(e *insie, accName string) {
 	// Set this map to nil so that the no-interest is
 	// no longer checked.
 	e.ni = nil
-	// Capture this since we are passing it to a go-routine.
-	account := string(accName)
 	s := c.srv
+
+	remoteGWName := c.gw.name
+	c.Noticef("Gateway %q: switching account %q to %s mode",
+		remoteGWName, accName, InterestOnly)
 
 	// Function that will create an INFO protocol
 	// and set proper command.
@@ -2562,7 +2699,7 @@ func (c *client) gatewaySwitchAccountToSendAllSubs(e *insie, accName []byte) {
 		info := Info{
 			Gateway:           s.getGatewayName(),
 			GatewayCmd:        cmd,
-			GatewayCmdPayload: []byte(account),
+			GatewayCmdPayload: []byte(accName),
 		}
 
 		b, _ := json.Marshal(&info)
@@ -2587,10 +2724,13 @@ func (c *client) gatewaySwitchAccountToSendAllSubs(e *insie, accName []byte) {
 	s.startGoRoutine(func() {
 		defer s.grWG.Done()
 
-		s.sendAccountSubsToGateway(c, []byte(account))
+		s.sendAccountSubsToGateway(c, []byte(accName))
 		// Send the complete command. When the remote receives
 		// this, it will not send a message unless it has a
 		// matching sub from us.
 		sendCmd(gatewayCmdAllSubsComplete, true)
+
+		c.Noticef("Gateway %q: switching account %q to %s mode complete",
+			remoteGWName, accName, InterestOnly)
 	})
 }

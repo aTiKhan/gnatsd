@@ -1,4 +1,4 @@
-// Copyright 2012-2018 The NATS Authors
+// Copyright 2012-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -26,7 +26,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/gnatsd/server"
+	"github.com/nats-io/nats-server/v2/server"
 )
 
 // So we can pass tests and benchmarks..
@@ -350,8 +350,12 @@ func expectDisconnect(t *testing.T, c net.Conn) {
 }
 
 func expectNothing(t tLogger, c net.Conn) {
+	expectNothingTimeout(t, c, time.Now().Add(100*time.Millisecond))
+}
+
+func expectNothingTimeout(t tLogger, c net.Conn, dl time.Time) {
 	expBuf := make([]byte, 32)
-	c.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	c.SetReadDeadline(dl)
 	n, err := c.Read(expBuf)
 	c.SetReadDeadline(time.Time{})
 	if err == nil && n > 0 {

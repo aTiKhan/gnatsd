@@ -24,17 +24,36 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
-	"github.com/nats-io/gnatsd/conf"
 	"github.com/nats-io/jwt"
+	"github.com/nats-io/nats-server/v2/conf"
 	"github.com/nats-io/nkeys"
 )
 
+var allowUnknownTopLevelField = int32(0)
+
+// NoErrOnUnknownFields can be used to change the behavior the processing
+// of a configuration file. By default, an error is reported if unknown
+// fields are found. If `noError` is set to true, no error will be reported
+// if top-level unknown fields are found.
+func NoErrOnUnknownFields(noError bool) {
+	var val int32
+	if noError {
+		val = int32(1)
+	}
+	atomic.StoreInt32(&allowUnknownTopLevelField, val)
+}
+
 // ClusterOpts are options for clusters.
+// NOTE: This structure is no longer used for monitoring endpoints
+// and json tags are deprecated and may be removed in the future.
 type ClusterOpts struct {
 	Host           string            `json:"addr,omitempty"`
 	Port           int               `json:"cluster_port,omitempty"`
@@ -52,6 +71,8 @@ type ClusterOpts struct {
 }
 
 // GatewayOpts are options for gateways.
+// NOTE: This structure is no longer used for monitoring endpoints
+// and json tags are deprecated and may be removed in the future.
 type GatewayOpts struct {
 	Name           string               `json:"name"`
 	Host           string               `json:"addr,omitempty"`
@@ -73,6 +94,8 @@ type GatewayOpts struct {
 }
 
 // RemoteGatewayOpts are options for connecting to a remote gateway
+// NOTE: This structure is no longer used for monitoring endpoints
+// and json tags are deprecated and may be removed in the future.
 type RemoteGatewayOpts struct {
 	Name       string      `json:"name"`
 	TLSConfig  *tls.Config `json:"-"`
@@ -82,18 +105,22 @@ type RemoteGatewayOpts struct {
 
 // LeafNodeOpts are options for a given server to accept leaf node connections and/or connect to a remote cluster.
 type LeafNodeOpts struct {
-	Host              string            `json:"addr,omitempty"`
-	Port              int               `json:"port,omitempty"`
-	Username          string            `json:"-"`
-	Password          string            `json:"-"`
-	AuthTimeout       float64           `json:"auth_timeout,omitempty"`
-	TLSConfig         *tls.Config       `json:"-"`
-	TLSTimeout        float64           `json:"tls_timeout,omitempty"`
-	TLSMap            bool              `json:"-"`
-	Remotes           []*RemoteLeafOpts `json:"remotes,omitempty"`
-	Advertise         string            `json:"-"`
-	NoAdvertise       bool              `json:"-"`
-	ReconnectInterval time.Duration     `json:"-"`
+	Host              string        `json:"addr,omitempty"`
+	Port              int           `json:"port,omitempty"`
+	Username          string        `json:"-"`
+	Password          string        `json:"-"`
+	Account           string        `json:"-"`
+	Users             []*User       `json:"-"`
+	AuthTimeout       float64       `json:"auth_timeout,omitempty"`
+	TLSConfig         *tls.Config   `json:"-"`
+	TLSTimeout        float64       `json:"tls_timeout,omitempty"`
+	TLSMap            bool          `json:"-"`
+	Advertise         string        `json:"-"`
+	NoAdvertise       bool          `json:"-"`
+	ReconnectInterval time.Duration `json:"-"`
+
+	// For solicited connections to other clusters/superclusters.
+	Remotes []*RemoteLeafOpts `json:"remotes,omitempty"`
 
 	// Not exported, for tests.
 	resolver    netResolver
@@ -103,14 +130,16 @@ type LeafNodeOpts struct {
 // RemoteLeafOpts are options for connecting to a remote server as a leaf node.
 type RemoteLeafOpts struct {
 	LocalAccount string      `json:"local_account,omitempty"`
-	URL          *url.URL    `json:"url,omitempty"`
+	URLs         []*url.URL  `json:"urls,omitempty"`
 	Credentials  string      `json:"-"`
 	TLS          bool        `json:"-"`
 	TLSConfig    *tls.Config `json:"-"`
 	TLSTimeout   float64     `json:"tls_timeout,omitempty"`
 }
 
-// Options block for gnatsd server.
+// Options block for nats-server.
+// NOTE: This structure is no longer used for monitoring endpoints
+// and json tags are deprecated and may be removed in the future.
 type Options struct {
 	ConfigFile       string        `json:"-"`
 	Host             string        `json:"addr"`
@@ -120,6 +149,7 @@ type Options struct {
 	Debug            bool          `json:"-"`
 	NoLog            bool          `json:"-"`
 	NoSigs           bool          `json:"-"`
+	NoSublistCache   bool          `json:"-"`
 	Logtime          bool          `json:"-"`
 	MaxConn          int           `json:"max_connections"`
 	MaxSubs          int           `json:"max_subscriptions,omitempty"`
@@ -162,6 +192,8 @@ type Options struct {
 	WriteDeadline    time.Duration `json:"-"`
 	MaxClosedClients int           `json:"-"`
 	LameDuckDuration time.Duration `json:"-"`
+	// MaxTracedMsgLen is the maximum printable length for traced messages.
+	MaxTracedMsgLen int `json:"-"`
 
 	// Operating a trusted NATS server
 	TrustedKeys      []string              `json:"-"`
@@ -174,6 +206,16 @@ type Options struct {
 
 	// CheckConfig configuration file syntax test was successful and exit.
 	CheckConfig bool `json:"-"`
+
+	// ConnectErrorReports specifies the number of failed attempts
+	// at which point server should report the failure of an initial
+	// connection to a route, gateway or leaf node.
+	// See DEFAULT_CONNECT_ERROR_REPORTS for default value.
+	ConnectErrorReports int
+
+	// ReconnectErrorReports is similar to ConnectErrorReports except
+	// that this applies to reconnect events.
+	ReconnectErrorReports int
 
 	// private fields, used to know if bool options are explicitly
 	// defined in config and/or command line params.
@@ -250,6 +292,7 @@ type authorization struct {
 	user  string
 	pass  string
 	token string
+	acc   string
 	// Multiple Nkeys/Users
 	nkeys              []*NkeyUser
 	users              []*User
@@ -333,6 +376,28 @@ func unwrapValue(v interface{}) (token, interface{}) {
 	}
 }
 
+// configureSystemAccount configures a system account
+// if present in the configuration.
+func configureSystemAccount(o *Options, m map[string]interface{}) error {
+	configure := func(v interface{}) error {
+		tk, v := unwrapValue(v)
+		sa, ok := v.(string)
+		if !ok {
+			return &configErr{tk, fmt.Sprintf("system account name must be a string")}
+		}
+		o.SystemAccount = sa
+		return nil
+	}
+
+	if v, ok := m["system_account"]; ok {
+		return configure(v)
+	} else if v, ok := m["system"]; ok {
+		return configure(v)
+	}
+
+	return nil
+}
+
 // ProcessConfigFile updates the Options structure with options
 // present in the given configuration file.
 // This version is convenient if one wants to set some default
@@ -360,6 +425,12 @@ func (o *Options) ProcessConfigFile(configFile string) error {
 	errors := make([]error, 0)
 	warnings := make([]error, 0)
 
+	// First check whether a system account has been defined,
+	// as that is a condition for other features to be enabled.
+	if err := configureSystemAccount(o, m); err != nil {
+		errors = append(errors, err)
+	}
+
 	for k, v := range m {
 		tk, v := unwrapValue(v)
 		switch strings.ToLower(k) {
@@ -386,6 +457,8 @@ func (o *Options) ProcessConfigFile(configFile string) error {
 		case "logtime":
 			o.Logtime = v.(bool)
 			trackExplicitVal(o, &o.inConfig, "Logtime", o.Logtime)
+		case "disable_sublist_cache", "no_sublist_cache":
+			o.NoSublistCache = v.(bool)
 		case "accounts":
 			err := parseAccounts(tk, o, &errors, &warnings)
 			if err != nil {
@@ -499,6 +572,8 @@ func (o *Options) ProcessConfigFile(configFile string) error {
 			o.MaxPending = v.(int64)
 		case "max_connections", "max_conn":
 			o.MaxConn = int(v.(int64))
+		case "max_traced_msg_len":
+			o.MaxTracedMsgLen = int(v.(int64))
 		case "max_subscriptions", "max_subs":
 			o.MaxSubs = int(v.(int64))
 		case "ping_interval":
@@ -565,12 +640,10 @@ func (o *Options) ProcessConfigFile(configFile string) error {
 				err := &configErr{tk, fmt.Sprintf("error parsing operators: unsupported type %T", v)}
 				errors = append(errors, err)
 			}
-			// Assume for now these are file names.
-			// TODO(dlc) - If we try to read the file and it fails we could treat the string
-			// as the JWT itself.
+			// Assume for now these are file names, but they can also be the JWT itself inline.
 			o.TrustedOperators = make([]*jwt.OperatorClaims, 0, len(opFiles))
 			for _, fname := range opFiles {
-				opc, err := readOperatorJWT(fname)
+				opc, err := ReadOperatorJWT(fname)
 				if err != nil {
 					err := &configErr{tk, fmt.Sprintf("error parsing operator JWT: %v", err)}
 					errors = append(errors, err)
@@ -614,28 +687,32 @@ func (o *Options) ProcessConfigFile(configFile string) error {
 		case "resolver_preload":
 			mp, ok := v.(map[string]interface{})
 			if !ok {
-				err := &configErr{tk, fmt.Sprintf("preload should be a map of key:jwt")}
+				err := &configErr{tk, fmt.Sprintf("preload should be a map of account_public_key:account_jwt")}
 				errors = append(errors, err)
 				continue
 			}
 			o.resolverPreloads = make(map[string]string)
 			for key, val := range mp {
 				tk, val = unwrapValue(val)
-				if jwt, ok := val.(string); !ok {
-					err := &configErr{tk, fmt.Sprintf("preload map value should be a string jwt")}
+				if jwtstr, ok := val.(string); !ok {
+					err := &configErr{tk, fmt.Sprintf("preload map value should be a string JWT")}
 					errors = append(errors, err)
 					continue
 				} else {
-					o.resolverPreloads[key] = jwt
+					// Make sure this is a valid account JWT, that is a config error.
+					// We will warn of expirations, etc later.
+					if _, err := jwt.DecodeAccountClaims(jwtstr); err != nil {
+						err := &configErr{tk, fmt.Sprintf("invalid account JWT")}
+						errors = append(errors, err)
+						continue
+					}
+					o.resolverPreloads[key] = jwtstr
 				}
 			}
 		case "system_account", "system":
-			if sa, ok := v.(string); !ok {
-				err := &configErr{tk, fmt.Sprintf("system account name must be a string")}
-				errors = append(errors, err)
-			} else {
-				o.SystemAccount = sa
-			}
+			// Already processed at the beginning so we just skip them
+			// to not treat them as unknown values.
+			continue
 		case "trusted", "trusted_keys":
 			switch v := v.(type) {
 			case string:
@@ -666,8 +743,12 @@ func (o *Options) ProcessConfigFile(configFile string) error {
 					errors = append(errors, err)
 				}
 			}
+		case "connect_error_reports":
+			o.ConnectErrorReports = int(v.(int64))
+		case "reconnect_error_reports":
+			o.ReconnectErrorReports = int(v.(int64))
 		default:
-			if !tk.IsUsedVariable() {
+			if au := atomic.LoadInt32(&allowUnknownTopLevelField); au == 0 && !tk.IsUsedVariable() {
 				err := &unknownConfigFieldErr{
 					field: k,
 					configErr: configErr{
@@ -807,6 +888,12 @@ func parseCluster(v interface{}, opts *Options, errors *[]error, warnings *[]err
 		case "permissions":
 			perms, err := parseUserPermissions(mv, errors, warnings)
 			if err != nil {
+				*errors = append(*errors, err)
+				continue
+			}
+			// Dynamic response permissions do not make sense here.
+			if perms.Response != nil {
+				err := &configErr{tk, fmt.Sprintf("Cluster permissions do not support dynamic responses")}
 				*errors = append(*errors, err)
 				continue
 			}
@@ -957,20 +1044,21 @@ func parseLeafNodes(v interface{}, opts *Options, errors *[]error, warnings *[]e
 		case "host", "net":
 			opts.LeafNode.Host = mv.(string)
 		case "authorization":
-			auth, err := parseAuthorization(tk, opts, errors, warnings)
+			auth, err := parseLeafAuthorization(tk, errors, warnings)
 			if err != nil {
-				*errors = append(*errors, err)
-				continue
-			}
-			if auth.users != nil {
-				err := &configErr{tk, fmt.Sprintf("Leafnode authorization does not allow multiple users")}
 				*errors = append(*errors, err)
 				continue
 			}
 			opts.LeafNode.Username = auth.user
 			opts.LeafNode.Password = auth.pass
 			opts.LeafNode.AuthTimeout = auth.timeout
-
+			opts.LeafNode.Account = auth.acc
+			opts.LeafNode.Users = auth.users
+			// Validate user info config for leafnode authorization
+			if err := validateLeafNodeAuthOptions(opts); err != nil {
+				*errors = append(*errors, &configErr{tk, err.Error()})
+				continue
+			}
 		case "remotes":
 			// Parse the remote options here.
 			remotes, err := parseRemoteLeafNodes(mv, errors, warnings)
@@ -978,6 +1066,8 @@ func parseLeafNodes(v interface{}, opts *Options, errors *[]error, warnings *[]e
 				continue
 			}
 			opts.LeafNode.Remotes = remotes
+		case "reconnect", "reconnect_delay", "reconnect_interval":
+			opts.LeafNode.ReconnectInterval = time.Duration(int(mv.(int64))) * time.Second
 		case "tls":
 			tc, err := parseTLS(tk)
 			if err != nil {
@@ -1011,6 +1101,114 @@ func parseLeafNodes(v interface{}, opts *Options, errors *[]error, warnings *[]e
 	return nil
 }
 
+// This is the authorization parser adapter for the leafnode's
+// authorization config.
+func parseLeafAuthorization(v interface{}, errors *[]error, warnings *[]error) (*authorization, error) {
+	var (
+		am   map[string]interface{}
+		tk   token
+		auth = &authorization{}
+	)
+	_, v = unwrapValue(v)
+	am = v.(map[string]interface{})
+	for mk, mv := range am {
+		tk, mv = unwrapValue(mv)
+		switch strings.ToLower(mk) {
+		case "user", "username":
+			auth.user = mv.(string)
+		case "pass", "password":
+			auth.pass = mv.(string)
+		case "timeout":
+			at := float64(1)
+			switch mv := mv.(type) {
+			case int64:
+				at = float64(mv)
+			case float64:
+				at = mv
+			}
+			auth.timeout = at
+		case "users":
+			users, err := parseLeafUsers(tk, errors, warnings)
+			if err != nil {
+				*errors = append(*errors, err)
+				continue
+			}
+			auth.users = users
+		case "account":
+			auth.acc = mv.(string)
+		default:
+			if !tk.IsUsedVariable() {
+				err := &unknownConfigFieldErr{
+					field: mk,
+					configErr: configErr{
+						token: tk,
+					},
+				}
+				*errors = append(*errors, err)
+			}
+			continue
+		}
+	}
+	return auth, nil
+}
+
+// This is a trimmed down version of parseUsers that is adapted
+// for the users possibly defined in the authorization{} section
+// of leafnodes {}.
+func parseLeafUsers(mv interface{}, errors *[]error, warnings *[]error) ([]*User, error) {
+	var (
+		tk    token
+		users = []*User{}
+	)
+	tk, mv = unwrapValue(mv)
+	// Make sure we have an array
+	uv, ok := mv.([]interface{})
+	if !ok {
+		return nil, &configErr{tk, fmt.Sprintf("Expected users field to be an array, got %v", mv)}
+	}
+	for _, u := range uv {
+		tk, u = unwrapValue(u)
+		// Check its a map/struct
+		um, ok := u.(map[string]interface{})
+		if !ok {
+			err := &configErr{tk, fmt.Sprintf("Expected user entry to be a map/struct, got %v", u)}
+			*errors = append(*errors, err)
+			continue
+		}
+		user := &User{}
+		for k, v := range um {
+			tk, v = unwrapValue(v)
+			switch strings.ToLower(k) {
+			case "user", "username":
+				user.Username = v.(string)
+			case "pass", "password":
+				user.Password = v.(string)
+			case "account":
+				// We really want to save just the account name here, but
+				// the User object is *Account. So we create an account object
+				// but it won't be registered anywhere. The server will just
+				// use opts.LeafNode.Users[].Account.Name. Alternatively
+				// we need to create internal objects to store u/p and account
+				// name and have a server structure to hold that.
+				user.Account = NewAccount(v.(string))
+			default:
+				if !tk.IsUsedVariable() {
+					err := &unknownConfigFieldErr{
+						field: k,
+						configErr: configErr{
+							token: tk,
+						},
+					}
+					*errors = append(*errors, err)
+					continue
+				}
+			}
+		}
+		users = append(users, user)
+	}
+	return users, nil
+}
+
 func parseRemoteLeafNodes(v interface{}, errors *[]error, warnings *[]error) ([]*RemoteLeafOpts, error) {
 	tk, v := unwrapValue(v)
 	ra, ok := v.([]interface{})
@@ -1030,17 +1228,32 @@ func parseRemoteLeafNodes(v interface{}, errors *[]error, warnings *[]error) ([]
 		for k, v := range rm {
 			tk, v = unwrapValue(v)
 			switch strings.ToLower(k) {
-			case "url":
-				url, err := parseURL(v.(string), "leafnode")
+			case "url", "urls":
+				switch v := v.(type) {
+				case []interface{}, []string:
+					urls, errs := parseURLs(v.([]interface{}), "leafnode")
+					if errs != nil {
+						*errors = append(*errors, errs...)
+						continue
+					}
+					remote.URLs = urls
+				case string:
+					url, err := parseURL(v, "leafnode")
+					if err != nil {
+						*errors = append(*errors, &configErr{tk, err.Error()})
+						continue
+					}
+					remote.URLs = append(remote.URLs, url)
+				}
+			case "account", "local":
+				remote.LocalAccount = v.(string)
+			case "creds", "credentials":
+				p, err := expandPath(v.(string))
 				if err != nil {
 					*errors = append(*errors, &configErr{tk, err.Error()})
 					continue
 				}
-				remote.URL = url
-			case "account", "local":
-				remote.LocalAccount = v.(string)
-			case "creds", "credentials":
-				remote.Credentials = v.(string)
+				remote.Credentials = p
 			case "tls":
 				tc, err := parseTLS(tk)
 				if err != nil {
@@ -1055,7 +1268,11 @@ func parseRemoteLeafNodes(v interface{}, errors *[]error, warnings *[]error) ([]
 				// Set RootCAs since this tls.Config is used when soliciting
 				// a connection (therefore behaves as a client).
 				remote.TLSConfig.RootCAs = remote.TLSConfig.ClientCAs
-				remote.TLSTimeout = tc.Timeout
+				if tc.Timeout > 0 {
+					remote.TLSTimeout = tc.Timeout
+				} else {
+					remote.TLSTimeout = float64(DEFAULT_LEAF_TLS_TIMEOUT)
+				}
 			default:
 				if !tk.IsUsedVariable() {
 					err := &unknownConfigFieldErr{
@@ -1176,6 +1393,8 @@ type export struct {
 	acc  *Account
 	sub  string
 	accs []string
+	rt   ServiceRespType
+	lat  *serviceLatency
 }
 
 type importStream struct {
@@ -1368,10 +1587,24 @@ func parseAccounts(v interface{}, opts *Options, errors *[]error, warnings *[]er
 			}
 			accounts = append(accounts, ta)
 		}
-		if err := service.acc.AddServiceExport(service.sub, accounts); err != nil {
+		if err := service.acc.AddServiceExportWithResponse(service.sub, service.rt, accounts); err != nil {
 			msg := fmt.Sprintf("Error adding service export %q: %v", service.sub, err)
 			*errors = append(*errors, &configErr{tk, msg})
 			continue
+		}
+
+		if service.lat != nil {
+			if opts.SystemAccount == "" {
+				msg := fmt.Sprintf("Error adding service latency sampling for %q: %v", service.sub, ErrNoSysAccount.Error())
+				*errors = append(*errors, &configErr{tk, msg})
+				continue
+			}
+
+			if err := service.acc.TrackServiceExportWithSampling(service.sub, service.lat.subject, int(service.lat.sampling)); err != nil {
+				msg := fmt.Sprintf("Error adding service latency sampling for %q on subject %q: %v", service.sub, service.lat.subject, err)
+				*errors = append(*errors, &configErr{tk, msg})
+				continue
+			}
 		}
 	}
 	for _, stream := range importStreams {
@@ -1407,7 +1640,7 @@ func parseAccounts(v interface{}, opts *Options, errors *[]error, warnings *[]er
 	return nil
 }
 
-// Parse the account imports
+// Parse the account exports
 func parseAccountExports(v interface{}, acc *Account, errors, warnings *[]error) ([]*export, []*export, error) {
 	// This should be an array of objects/maps.
 	tk, v := unwrapValue(v)
@@ -1449,6 +1682,7 @@ func parseAccountImports(v interface{}, acc *Account, errors, warnings *[]error)
 
 	var services []*importService
 	var streams []*importStream
+	svcSubjects := map[string]*importService{}
 
 	for _, v := range ims {
 		// Should have stream or service
@@ -1458,6 +1692,15 @@ func parseAccountImports(v interface{}, acc *Account, errors, warnings *[]error)
 			continue
 		}
 		if service != nil {
+			if dup := svcSubjects[service.to]; dup != nil {
+				tk, _ := unwrapValue(v)
+				err := &configErr{tk,
+					fmt.Sprintf("Duplicate service import subject %q, previously used in import for account %q, subject %q",
+						service.to, dup.an, dup.sub)}
+				*errors = append(*errors, err)
+				continue
+			}
+			svcSubjects[service.to] = service
 			service.acc = acc
 			services = append(services, service)
 		}
@@ -1494,7 +1737,7 @@ func parseAccount(v map[string]interface{}, errors, warnings *[]error) (string, 
 	return accountName, subject, nil
 }
 
-// Parse an import stream or service.
+// Parse an export stream or service.
 // e.g.
 //   {stream: "public.>"} # No accounts means public.
 //   {stream: "synadia.private.>", accounts: [cncf, natsio]}
@@ -1505,6 +1748,11 @@ func parseExportStreamOrService(v interface{}, errors, warnings *[]error) (*expo
 		curStream  *export
 		curService *export
 		accounts   []string
+		rt         ServiceRespType
+		rtSeen     bool
+		rtToken    token
+		lat        *serviceLatency
+		latToken   token
 	)
 	tk, v := unwrapValue(v)
 	vv, ok := v.(map[string]interface{})
@@ -1520,7 +1768,16 @@ func parseExportStreamOrService(v interface{}, errors, warnings *[]error) (*expo
 				*errors = append(*errors, err)
 				continue
 			}
-
+			if rtToken != nil {
+				err := &configErr{rtToken, "Detected response directive on non-service"}
+				*errors = append(*errors, err)
+				continue
+			}
+			if latToken != nil {
+				err := &configErr{latToken, "Detected latency directive on non-service"}
+				*errors = append(*errors, err)
+				continue
+			}
 			mvs, ok := mv.(string)
 			if !ok {
 				err := &configErr{tk, fmt.Sprintf("Expected stream name to be string, got %T", mv)}
@@ -1530,6 +1787,34 @@ func parseExportStreamOrService(v interface{}, errors, warnings *[]error) (*expo
 			curStream = &export{sub: mvs}
 			if accounts != nil {
 				curStream.accs = accounts
+			}
+		case "response", "response_type":
+			rtSeen = true
+			rtToken = tk
+			mvs, ok := mv.(string)
+			if !ok {
+				err := &configErr{tk, fmt.Sprintf("Expected response type to be string, got %T", mv)}
+				*errors = append(*errors, err)
+				continue
+			}
+			switch strings.ToLower(mvs) {
+			case "single", "singleton":
+				rt = Singleton
+			case "stream":
+				rt = Stream
+			case "chunk", "chunked":
+				rt = Chunked
+			default:
+				err := &configErr{tk, fmt.Sprintf("Unknown response type: %q", mvs)}
+				*errors = append(*errors, err)
+				continue
+			}
+			if curService != nil {
+				curService.rt = rt
+			}
+			if curStream != nil {
+				err := &configErr{tk, "Detected response directive on non-service"}
+				*errors = append(*errors, err)
 			}
 		case "service":
 			if curStream != nil {
@@ -1547,6 +1832,12 @@ func parseExportStreamOrService(v interface{}, errors, warnings *[]error) (*expo
 			if accounts != nil {
 				curService.accs = accounts
 			}
+			if rtSeen {
+				curService.rt = rt
+			}
+			if lat != nil {
+				curService.lat = lat
+			}
 		case "accounts":
 			for _, iv := range mv.([]interface{}) {
 				_, mv := unwrapValue(iv)
@@ -1556,6 +1847,22 @@ func parseExportStreamOrService(v interface{}, errors, warnings *[]error) (*expo
 				curStream.accs = accounts
 			} else if curService != nil {
 				curService.accs = accounts
+			}
+		case "latency":
+			latToken = tk
+			var err error
+			lat, err = parseServiceLatency(tk, mv)
+			if err != nil {
+				*errors = append(*errors, err)
+				continue
+			}
+			if curStream != nil {
+				err = &configErr{tk, "Detected latency directive on non-service"}
+				*errors = append(*errors, err)
+				continue
+			}
+			if curService != nil {
+				curService.lat = lat
 			}
 		default:
 			if !tk.IsUsedVariable() {
@@ -1568,9 +1875,75 @@ func parseExportStreamOrService(v interface{}, errors, warnings *[]error) (*expo
 				*errors = append(*errors, err)
 			}
 		}
-
 	}
 	return curStream, curService, nil
+}
+
+// parseServiceLatency returns a latency config block.
+func parseServiceLatency(root token, v interface{}) (*serviceLatency, error) {
+	if subject, ok := v.(string); ok {
+		return &serviceLatency{
+			subject:  subject,
+			sampling: DEFAULT_SERVICE_LATENCY_SAMPLING,
+		}, nil
+	}
+
+	latency, ok := v.(map[string]interface{})
+	if !ok {
+		return nil, &configErr{token: root,
+			reason: fmt.Sprintf("Expected latency entry to be a map/struct or string, got %T", v)}
+	}
+
+	sl := serviceLatency{
+		sampling: DEFAULT_SERVICE_LATENCY_SAMPLING,
+	}
+
+	// Read sampling value.
+	if v, ok := latency["sampling"]; ok {
+		tk, v := unwrapValue(v)
+
+		var sample int64
+		switch vv := v.(type) {
+		case int64:
+			// Sample is an int, like 50.
+			sample = vv
+		case string:
+			// Sample is a string, like "50%".
+			s := strings.TrimSuffix(vv, "%")
+			n, err := strconv.Atoi(s)
+			if err != nil {
+				return nil, &configErr{token: tk,
+					reason: fmt.Sprintf("Failed to parse latency sample: %v", err)}
+			}
+			sample = int64(n)
+		default:
+			return nil, &configErr{token: tk,
+				reason: fmt.Sprintf("Expected latency sample to be a string or map/struct, got %T", v)}
+		}
+		if sample < 1 || sample > 100 {
+			return nil, &configErr{token: tk,
+				reason: ErrBadSampling.Error()}
+		}
+
+		sl.sampling = int8(sample)
+	}
+
+	// Read subject value.
+	v, ok = latency["subject"]
+	if !ok {
+		return nil, &configErr{token: root,
+			reason: "Latency subject required, but missing"}
+	}
+
+	tk, v := unwrapValue(v)
+	subject, ok := v.(string)
+	if !ok {
+		return nil, &configErr{token: tk,
+			reason: fmt.Sprintf("Expected latency subject to be a string, got %T", subject)}
+	}
+	sl.subject = subject
+
+	return &sl, nil
 }
 
 // Parse an import stream or service.
@@ -1844,26 +2217,49 @@ func parseUserPermissions(mv interface{}, errors, warnings *[]error) (*Permissio
 		return nil, &configErr{tk, fmt.Sprintf("Expected permissions to be a map/struct, got %+v", mv)}
 	}
 	for k, v := range pm {
-		tk, v = unwrapValue(v)
+		tk, mv = unwrapValue(v)
 
 		switch strings.ToLower(k) {
 		// For routes:
 		// Import is Publish
 		// Export is Subscribe
 		case "pub", "publish", "import":
-			perms, err := parseVariablePermissions(v, errors, warnings)
+			perms, err := parseVariablePermissions(mv, errors, warnings)
 			if err != nil {
 				*errors = append(*errors, err)
 				continue
 			}
 			p.Publish = perms
 		case "sub", "subscribe", "export":
-			perms, err := parseVariablePermissions(v, errors, warnings)
+			perms, err := parseVariablePermissions(mv, errors, warnings)
 			if err != nil {
 				*errors = append(*errors, err)
 				continue
 			}
 			p.Subscribe = perms
+		case "publish_allow_responses", "allow_responses":
+			rp := &ResponsePermission{
+				MaxMsgs: DEFAULT_ALLOW_RESPONSE_MAX_MSGS,
+				Expires: DEFAULT_ALLOW_RESPONSE_EXPIRATION,
+			}
+			// Try boolean first
+			responses, ok := mv.(bool)
+			if ok {
+				if responses {
+					p.Response = rp
+				}
+			} else {
+				p.Response = parseAllowResponses(v, errors, warnings)
+			}
+			if p.Response != nil {
+				if p.Publish == nil {
+					p.Publish = &SubjectPermission{}
+				}
+				if p.Publish.Allow == nil {
+					// We turn off the blanket allow statement.
+					p.Publish.Allow = []string{}
+				}
+			}
 		default:
 			if !tk.IsUsedVariable() {
 				err := &configErr{tk, fmt.Sprintf("Unknown field %q parsing permissions", k)}
@@ -1886,7 +2282,7 @@ func parseVariablePermissions(v interface{}, errors, warnings *[]error) (*Subjec
 	}
 }
 
-// Helper function to parse subject singeltons and/or arrays
+// Helper function to parse subject singletons and/or arrays
 func parseSubjects(v interface{}, errors, warnings *[]error) ([]string, error) {
 	tk, v := unwrapValue(v)
 
@@ -1913,6 +2309,61 @@ func parseSubjects(v interface{}, errors, warnings *[]error) ([]string, error) {
 		return nil, &configErr{tk, err.Error()}
 	}
 	return subjects, nil
+}
+
+// Helper function to parse a ResponsePermission.
+func parseAllowResponses(v interface{}, errors, warnings *[]error) *ResponsePermission {
+	tk, v := unwrapValue(v)
+	// Check if this is a map.
+	pm, ok := v.(map[string]interface{})
+	if !ok {
+		err := &configErr{tk, "error parsing response permissions, expected a boolean or a map"}
+		*errors = append(*errors, err)
+		return nil
+	}
+
+	rp := &ResponsePermission{
+		MaxMsgs: DEFAULT_ALLOW_RESPONSE_MAX_MSGS,
+		Expires: DEFAULT_ALLOW_RESPONSE_EXPIRATION,
+	}
+
+	for k, v := range pm {
+		tk, v = unwrapValue(v)
+		switch strings.ToLower(k) {
+		case "max", "max_msgs", "max_messages", "max_responses":
+			max := int(v.(int64))
+			// Negative values are accepted (mean infinite), and 0
+			// means default value (set above).
+			if max != 0 {
+				rp.MaxMsgs = max
+			}
+		case "expires", "expiration", "ttl":
+			wd, ok := v.(string)
+			if ok {
+				ttl, err := time.ParseDuration(wd)
+				if err != nil {
+					err := &configErr{tk, fmt.Sprintf("error parsing expires: %v", err)}
+					*errors = append(*errors, err)
+					return nil
+				}
+				// Negative values are accepted (mean infinite), and 0
+				// means default value (set above).
+				if ttl != 0 {
+					rp.Expires = ttl
+				}
+			} else {
+				err := &configErr{tk, "error parsing expires, not a duration string"}
+				*errors = append(*errors, err)
+				return nil
+			}
+		default:
+			if !tk.IsUsedVariable() {
+				err := &configErr{tk, fmt.Sprintf("Unknown field %q parsing permissions", k)}
+				*errors = append(*errors, err)
+			}
+		}
+	}
+	return rp
 }
 
 // Helper function to parse old style authorization configs.
@@ -2103,27 +2554,33 @@ func parseTLS(v interface{}) (*TLSConfigOpts, error) {
 
 // GenTLSConfig loads TLS related configuration parameters.
 func GenTLSConfig(tc *TLSConfigOpts) (*tls.Config, error) {
-
-	// Now load in cert and private key
-	cert, err := tls.LoadX509KeyPair(tc.CertFile, tc.KeyFile)
-	if err != nil {
-		return nil, fmt.Errorf("error parsing X509 certificate/key pair: %v", err)
-	}
-	cert.Leaf, err = x509.ParseCertificate(cert.Certificate[0])
-	if err != nil {
-		return nil, fmt.Errorf("error parsing certificate: %v", err)
-	}
-
-	// Create the tls.Config from our options.
-	// We will determine the cipher suites that we prefer.
+	// Create the tls.Config from our options before including the certs.
+	// It will determine the cipher suites that we prefer.
 	// FIXME(dlc) change if ARM based.
 	config := tls.Config{
 		MinVersion:               tls.VersionTLS12,
 		CipherSuites:             tc.Ciphers,
 		PreferServerCipherSuites: true,
 		CurvePreferences:         tc.CurvePreferences,
-		Certificates:             []tls.Certificate{cert},
 		InsecureSkipVerify:       tc.Insecure,
+	}
+
+	switch {
+	case tc.CertFile != "" && tc.KeyFile == "":
+		return nil, fmt.Errorf("missing 'key_file' in TLS configuration")
+	case tc.CertFile == "" && tc.KeyFile != "":
+		return nil, fmt.Errorf("missing 'cert_file' in TLS configuration")
+	case tc.CertFile != "" && tc.KeyFile != "":
+		// Now load in cert and private key
+		cert, err := tls.LoadX509KeyPair(tc.CertFile, tc.KeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing X509 certificate/key pair: %v", err)
+		}
+		cert.Leaf, err = x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			return nil, fmt.Errorf("error parsing certificate: %v", err)
+		}
+		config.Certificates = []tls.Certificate{cert}
 	}
 
 	// Require client certificates as needed
@@ -2376,10 +2833,22 @@ func setBaselineOptions(opts *Options) {
 			opts.LeafNode.AuthTimeout = float64(AUTH_TIMEOUT) / float64(time.Second)
 		}
 	}
+	// Set baseline connect port for remotes.
+	for _, r := range opts.LeafNode.Remotes {
+		if r != nil {
+			for _, u := range r.URLs {
+				if u.Port() == "" {
+					u.Host = net.JoinHostPort(u.Host, strconv.Itoa(DEFAULT_LEAFNODE_PORT))
+				}
+			}
+		}
+	}
+
 	// Set this regardless of opts.LeafNode.Port
 	if opts.LeafNode.ReconnectInterval == 0 {
 		opts.LeafNode.ReconnectInterval = DEFAULT_LEAF_NODE_RECONNECT
 	}
+
 	if opts.MaxControlLine == 0 {
 		opts.MaxControlLine = MAX_CONTROL_LINE_SIZE
 	}
@@ -2408,6 +2877,12 @@ func setBaselineOptions(opts *Options) {
 		if opts.Gateway.AuthTimeout == 0 {
 			opts.Gateway.AuthTimeout = float64(AUTH_TIMEOUT) / float64(time.Second)
 		}
+	}
+	if opts.ConnectErrorReports == 0 {
+		opts.ConnectErrorReports = DEFAULT_CONNECT_ERROR_REPORTS
+	}
+	if opts.ReconnectErrorReports == 0 {
+		opts.ReconnectErrorReports = DEFAULT_RECONNECT_ERROR_REPORTS
 	}
 }
 
@@ -2452,8 +2927,8 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 	fs.StringVar(&configFile, "c", "", "Configuration file.")
 	fs.StringVar(&configFile, "config", "", "Configuration file.")
 	fs.BoolVar(&opts.CheckConfig, "t", false, "Check configuration and exit.")
-	fs.StringVar(&signal, "sl", "", "Send signal to gnatsd process (stop, quit, reopen, reload)")
-	fs.StringVar(&signal, "signal", "", "Send signal to gnatsd process (stop, quit, reopen, reload)")
+	fs.StringVar(&signal, "sl", "", "Send signal to nats-server process (stop, quit, reopen, reload)")
+	fs.StringVar(&signal, "signal", "", "Send signal to nats-server process (stop, quit, reopen, reload)")
 	fs.StringVar(&opts.PidFile, "P", "", "File to store process pid.")
 	fs.StringVar(&opts.PidFile, "pid", "", "File to store process pid.")
 	fs.StringVar(&opts.PortsFileDir, "ports_file_dir", "", "Creates a ports file in the specified directory (<executable_name>_<pid>.ports)")
@@ -2478,6 +2953,7 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 	fs.StringVar(&opts.TLSCert, "tlscert", "", "Server certificate file.")
 	fs.StringVar(&opts.TLSKey, "tlskey", "", "Private key for server certificate.")
 	fs.StringVar(&opts.TLSCaCert, "tlscacert", "", "Client certificate CA for verification.")
+	fs.IntVar(&opts.MaxTracedMsgLen, "max_traced_msg_len", 0, "Maximum printable length for traced messages. 0 for unlimited")
 
 	// The flags definition above set "default" values to some of the options.
 	// Calling Parse() here will override the default options with any value
@@ -2681,6 +3157,15 @@ func overrideCluster(opts *Options) error {
 		opts.Cluster.Port = 0
 		return nil
 	}
+	// -1 will fail url.Parse, so if we have -1, change it to
+	// 0, and then after parse, replace the port with -1 so we get
+	// automatic port allocation
+	wantsRandom := false
+	if strings.HasSuffix(opts.Cluster.ListenStr, ":-1") {
+		wantsRandom = true
+		cls := fmt.Sprintf("%s:0", opts.Cluster.ListenStr[0:len(opts.Cluster.ListenStr)-3])
+		opts.Cluster.ListenStr = cls
+	}
 	clusterURL, err := url.Parse(opts.Cluster.ListenStr)
 	if err != nil {
 		return err
@@ -2688,6 +3173,9 @@ func overrideCluster(opts *Options) error {
 	h, p, err := net.SplitHostPort(clusterURL.Host)
 	if err != nil {
 		return err
+	}
+	if wantsRandom {
+		p = "-1"
 	}
 	opts.Cluster.Host = h
 	_, err = fmt.Sscan(p, &opts.Cluster.Port)
@@ -2740,4 +3228,42 @@ func maybeReadPidFile(pidStr string) string {
 		return string(b)
 	}
 	return pidStr
+}
+
+func homeDir() (string, error) {
+	if runtime.GOOS == "windows" {
+		homeDrive, homePath := os.Getenv("HOMEDRIVE"), os.Getenv("HOMEPATH")
+		userProfile := os.Getenv("USERPROFILE")
+
+		home := filepath.Join(homeDrive, homePath)
+		if homeDrive == "" || homePath == "" {
+			if userProfile == "" {
+				return "", errors.New("nats: failed to get home dir, require %HOMEDRIVE% and %HOMEPATH% or %USERPROFILE%")
+			}
+			home = userProfile
+		}
+
+		return home, nil
+	}
+
+	home := os.Getenv("HOME")
+	if home == "" {
+		return "", errors.New("failed to get home dir, require $HOME")
+	}
+	return home, nil
+}
+
+func expandPath(p string) (string, error) {
+	p = os.ExpandEnv(p)
+
+	if !strings.HasPrefix(p, "~") {
+		return p, nil
+	}
+
+	home, err := homeDir()
+	if err != nil {
+		return "", err
+	}
+
+	return filepath.Join(home, p[1:]), nil
 }

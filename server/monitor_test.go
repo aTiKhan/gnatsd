@@ -1,4 +1,4 @@
-// Copyright 2013-2018 The NATS Authors
+// Copyright 2013-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,12 +14,16 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"reflect"
 	"runtime"
 	"sort"
 	"strings"
@@ -28,9 +32,9 @@ import (
 	"time"
 	"unicode"
 
-	"net"
-
-	"github.com/nats-io/go-nats"
+	"github.com/nats-io/jwt"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nkeys"
 )
 
 const CLIENT_PORT = -1
@@ -62,7 +66,7 @@ func runMonitorServerNoHTTPPort() *Server {
 }
 
 func resetPreviousHTTPConnections() {
-	http.DefaultTransport = &http.Transport{}
+	http.DefaultTransport.(*http.Transport).CloseIdleConnections()
 }
 
 func TestMyUptime(t *testing.T) {
@@ -146,15 +150,19 @@ func readBody(t *testing.T, url string) []byte {
 }
 
 func pollVarz(t *testing.T, s *Server, mode int, url string, opts *VarzOptions) *Varz {
+	t.Helper()
 	if mode == 0 {
 		v := &Varz{}
 		body := readBody(t, url)
 		if err := json.Unmarshal(body, v); err != nil {
-			stackFatalf(t, "Got an error unmarshalling the body: %v\n", err)
+			t.Fatalf("Got an error unmarshalling the body: %v\n", err)
 		}
 		return v
 	}
-	v, _ := s.Varz(opts)
+	v, err := s.Varz(opts)
+	if err != nil {
+		t.Fatalf("Error on Varz: %v", err)
+	}
 	return v
 }
 
@@ -209,6 +217,7 @@ func TestHandleVarz(t *testing.T) {
 }
 
 func pollConz(t *testing.T, s *Server, mode int, url string, opts *ConnzOptions) *Connz {
+	t.Helper()
 	if mode == 0 {
 		body := readBody(t, url)
 		c := &Connz{}
@@ -219,7 +228,7 @@ func pollConz(t *testing.T, s *Server, mode int, url string, opts *ConnzOptions)
 	}
 	c, err := s.Connz(opts)
 	if err != nil {
-		stackFatalf(t, "Error on Connz(): %v", err)
+		t.Fatalf("Error on Connz(): %v", err)
 	}
 	return c
 }
@@ -814,6 +823,7 @@ func TestConnzSortedBySubs(t *testing.T) {
 }
 
 func TestConnzSortedByLast(t *testing.T) {
+	resetPreviousHTTPConnections()
 	opts := DefaultMonitorOptions()
 	s := RunServer(opts)
 	defer s.Shutdown()
@@ -1134,20 +1144,24 @@ func TestConnzSortBadRequest(t *testing.T) {
 }
 
 func pollRoutez(t *testing.T, s *Server, mode int, url string, opts *RoutezOptions) *Routez {
+	t.Helper()
 	if mode == 0 {
 		rz := &Routez{}
 		body := readBody(t, url)
 		if err := json.Unmarshal(body, rz); err != nil {
-			stackFatalf(t, "Got an error unmarshalling the body: %v\n", err)
+			t.Fatalf("Got an error unmarshalling the body: %v\n", err)
 		}
 		return rz
 	}
-	rz, _ := s.Routez(opts)
+	rz, err := s.Routez(opts)
+	if err != nil {
+		t.Fatalf("Error on Routez: %v", err)
+	}
 	return rz
 }
 
 func TestConnzWithRoutes(t *testing.T) {
-
+	resetPreviousHTTPConnections()
 	opts := DefaultMonitorOptions()
 	opts.Cluster.Host = "127.0.0.1"
 	opts.Cluster.Port = CLUSTER_PORT
@@ -1239,15 +1253,19 @@ func TestRoutezWithBadParams(t *testing.T) {
 }
 
 func pollSubsz(t *testing.T, s *Server, mode int, url string, opts *SubszOptions) *Subsz {
+	t.Helper()
 	if mode == 0 {
 		body := readBody(t, url)
 		sz := &Subsz{}
 		if err := json.Unmarshal(body, sz); err != nil {
-			stackFatalf(t, "Got an error unmarshalling the body: %v\n", err)
+			t.Fatalf("Got an error unmarshalling the body: %v\n", err)
 		}
 		return sz
 	}
-	sz, _ := s.Subsz(opts)
+	sz, err := s.Subsz(opts)
+	if err != nil {
+		t.Fatalf("Error on Subsz: %v", err)
+	}
 	return sz
 }
 
@@ -1907,6 +1925,7 @@ func TestClusterEmptyWhenNotDefined(t *testing.T) {
 }
 
 func TestRoutezPermissions(t *testing.T) {
+	resetPreviousHTTPConnections()
 	opts := DefaultMonitorOptions()
 	opts.Cluster.Host = "127.0.0.1"
 	opts.Cluster.Port = -1
@@ -2016,6 +2035,1355 @@ func Benchmark_Connz(b *testing.B) {
 		_, err := s.Connz(copts)
 		if err != nil {
 			b.Fatalf("Error on Connz(): %v", err)
+		}
+	}
+}
+
+func Benchmark_Varz(b *testing.B) {
+	runtime.MemProfileRate = 0
+
+	s := runMonitorServerNoHTTPPort()
+	defer s.Shutdown()
+
+	b.ResetTimer()
+	runtime.MemProfileRate = 1
+
+	for i := 0; i < b.N; i++ {
+		_, err := s.Varz(nil)
+		if err != nil {
+			b.Fatalf("Error on Connz(): %v", err)
+		}
+	}
+}
+
+func Benchmark_VarzHttp(b *testing.B) {
+	runtime.MemProfileRate = 0
+
+	s := runMonitorServer()
+	defer s.Shutdown()
+
+	murl := fmt.Sprintf("http://127.0.0.1:%d/varz", s.MonitorAddr().Port)
+
+	b.ResetTimer()
+	runtime.MemProfileRate = 1
+
+	for i := 0; i < b.N; i++ {
+		v := &Varz{}
+		resp, err := http.Get(murl)
+		if err != nil {
+			b.Fatalf("Expected no error: Got %v\n", err)
+		}
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			b.Fatalf("Got an error reading the body: %v\n", err)
+		}
+		if err := json.Unmarshal(body, v); err != nil {
+			b.Fatalf("Got an error unmarshalling the body: %v\n", err)
+		}
+		resp.Body.Close()
+	}
+}
+
+func TestVarzRaces(t *testing.T) {
+	s := runMonitorServer()
+	defer s.Shutdown()
+
+	murl := fmt.Sprintf("http://127.0.0.1:%d/varz", s.MonitorAddr().Port)
+	done := make(chan struct{})
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			for i := 0; i < 2; i++ {
+				v := pollVarz(t, s, i, murl, nil)
+				// Check the field that we are setting in main thread
+				// to ensure that we have a copy and there is no
+				// race with fields set in s.info and s.opts
+				if v.ID == "abc" || v.MaxConn == -1 {
+					// We will not get there. Need to have something
+					// otherwise staticcheck will report empty branch
+					return
+				}
+
+				select {
+				case <-done:
+					return
+				default:
+				}
+			}
+		}
+	}()
+
+	for i := 0; i < 1000; i++ {
+		// Simulate a change in server's info and options
+		// by changing something.
+		s.mu.Lock()
+		s.info.ID = fmt.Sprintf("serverid_%d", i)
+		s.opts.MaxConn = 100 + i
+		s.mu.Unlock()
+		time.Sleep(time.Nanosecond)
+	}
+	close(done)
+	wg.Wait()
+
+	// Now check that there is no race doing parallel polling
+	wg.Add(3)
+	done = make(chan struct{})
+	poll := func() {
+		defer wg.Done()
+		for {
+			for mode := 0; mode < 2; mode++ {
+				pollVarz(t, s, mode, murl, nil)
+			}
+			select {
+			case <-done:
+				return
+			default:
+			}
+		}
+	}
+	for i := 0; i < 3; i++ {
+		go poll()
+	}
+	time.Sleep(500 * time.Millisecond)
+	close(done)
+	wg.Wait()
+}
+
+func testMonitorStructPresent(t *testing.T, tag string) {
+	t.Helper()
+
+	resetPreviousHTTPConnections()
+	opts := DefaultMonitorOptions()
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	varzURL := fmt.Sprintf("http://127.0.0.1:%d/varz", s.MonitorAddr().Port)
+	body := readBody(t, varzURL)
+	if !bytes.Contains(body, []byte(`"`+tag+`": {}`)) {
+		t.Fatalf("%s should be present and empty, got %s", tag, body)
+	}
+}
+
+func TestMonitorCluster(t *testing.T) {
+	testMonitorStructPresent(t, "cluster")
+
+	resetPreviousHTTPConnections()
+	opts := DefaultMonitorOptions()
+	opts.Cluster.Port = -1
+	opts.Cluster.AuthTimeout = 1
+	opts.Routes = RoutesFromStr("nats://127.0.0.1:1234")
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	expected := ClusterOptsVarz{
+		opts.Cluster.Host,
+		opts.Cluster.Port,
+		opts.Cluster.AuthTimeout,
+		[]string{"127.0.0.1:1234"},
+	}
+
+	varzURL := fmt.Sprintf("http://127.0.0.1:%d/varz", s.MonitorAddr().Port)
+	for mode := 0; mode < 2; mode++ {
+		check := func(t *testing.T, v *Varz) {
+			t.Helper()
+			if !reflect.DeepEqual(v.Cluster, expected) {
+				t.Fatalf("mode=%v - expected %+v, got %+v", mode, expected, v.Cluster)
+			}
+		}
+		v := pollVarz(t, s, mode, varzURL, nil)
+		check(t, v)
+
+		// Having this here to make sure that if fields are added in ClusterOptsVarz,
+		// we make sure to update this test (compiler will report an error if we don't)
+		_ = ClusterOptsVarz{"", 0, 0, nil}
+
+		// Alter the fields to make sure that we have a proper deep copy
+		// of what may be stored in the server. Anything we change here
+		// should not affect the next returned value.
+		v.Cluster.Host = "wrong"
+		v.Cluster.Port = 0
+		v.Cluster.AuthTimeout = 0
+		v.Cluster.URLs = []string{"wrong"}
+		v = pollVarz(t, s, mode, varzURL, nil)
+		check(t, v)
+	}
+}
+
+func TestMonitorClusterURLs(t *testing.T) {
+	resetPreviousHTTPConnections()
+
+	o2 := DefaultOptions()
+	o2.Cluster.Host = "127.0.0.1"
+	s2 := RunServer(o2)
+	defer s2.Shutdown()
+
+	s2ClusterHostPort := fmt.Sprintf("127.0.0.1:%d", s2.ClusterAddr().Port)
+
+	template := `
+		port: -1
+		http: -1
+		cluster: {
+			port: -1
+			routes [
+				%s
+				%s
+			]
+		}
+	`
+	conf := createConfFile(t, []byte(fmt.Sprintf(template, "nats://"+s2ClusterHostPort, "")))
+	defer os.Remove(conf)
+	s1, _ := RunServerWithConfig(conf)
+	defer s1.Shutdown()
+
+	checkClusterFormed(t, s1, s2)
+
+	// Check /varz cluster{} to see the URLs from s1 to s2
+	varzURL := fmt.Sprintf("http://127.0.0.1:%d/varz", s1.MonitorAddr().Port)
+	for mode := 0; mode < 2; mode++ {
+		v := pollVarz(t, s1, mode, varzURL, nil)
+		if n := len(v.Cluster.URLs); n != 1 {
+			t.Fatalf("mode=%v - Expected 1 URL, got %v", mode, n)
+		}
+		if v.Cluster.URLs[0] != s2ClusterHostPort {
+			t.Fatalf("mode=%v - Expected url %q, got %q", mode, s2ClusterHostPort, v.Cluster.URLs[0])
+		}
+	}
+
+	otherClusterHostPort := "127.0.0.1:1234"
+	// Now update the config and add a route
+	changeCurrentConfigContentWithNewContent(t, conf, []byte(fmt.Sprintf(template, "nats://"+s2ClusterHostPort, "nats://"+otherClusterHostPort)))
+
+	if err := s1.Reload(); err != nil {
+		t.Fatalf("Error on reload: %v", err)
+	}
+
+	// Verify cluster still ok
+	checkClusterFormed(t, s1, s2)
+
+	// Now verify that s1 reports in /varz the new URL
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		for mode := 0; mode < 2; mode++ {
+			v := pollVarz(t, s1, mode, varzURL, nil)
+			if n := len(v.Cluster.URLs); n != 2 {
+				t.Fatalf("mode=%v - Expected 2 URL, got %v", mode, n)
+			}
+			gotS2 := false
+			gotOther := false
+			for _, u := range v.Cluster.URLs {
+				if u == s2ClusterHostPort {
+					gotS2 = true
+				} else if u == otherClusterHostPort {
+					gotOther = true
+				} else {
+					t.Fatalf("mode=%v - Incorrect url: %q", mode, u)
+				}
+			}
+			if !gotS2 {
+				t.Fatalf("mode=%v - Did not get cluster URL for s2", mode)
+			}
+			if !gotOther {
+				t.Fatalf("mode=%v - Did not get the new cluster URL", mode)
+			}
+		}
+		return nil
+	})
+
+	// Remove all routes from config
+	changeCurrentConfigContentWithNewContent(t, conf, []byte(fmt.Sprintf(template, "", "")))
+
+	if err := s1.Reload(); err != nil {
+		t.Fatalf("Error on reload: %v", err)
+	}
+
+	// Now verify that s1 reports no ULRs in /varz
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		for mode := 0; mode < 2; mode++ {
+			v := pollVarz(t, s1, mode, varzURL, nil)
+			if n := len(v.Cluster.URLs); n != 0 {
+				t.Fatalf("mode=%v - Expected 0 URL, got %v", mode, n)
+			}
+		}
+		return nil
+	})
+}
+
+func TestMonitorGateway(t *testing.T) {
+	testMonitorStructPresent(t, "gateway")
+
+	resetPreviousHTTPConnections()
+	opts := DefaultMonitorOptions()
+	opts.Gateway.Name = "A"
+	opts.Gateway.Port = -1
+	opts.Gateway.AuthTimeout = 1
+	opts.Gateway.TLSTimeout = 1
+	opts.Gateway.Advertise = "127.0.0.1"
+	opts.Gateway.ConnectRetries = 1
+	opts.Gateway.RejectUnknown = false
+	u1, _ := url.Parse("nats://ivan:pwd@localhost:1234")
+	u2, _ := url.Parse("nats://localhost:1235")
+	opts.Gateway.Gateways = []*RemoteGatewayOpts{
+		&RemoteGatewayOpts{
+			Name:       "B",
+			TLSTimeout: 1,
+			URLs: []*url.URL{
+				u1,
+				u2,
+			},
+		},
+	}
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	expected := GatewayOptsVarz{
+		"A",
+		opts.Gateway.Host,
+		opts.Gateway.Port,
+		opts.Gateway.AuthTimeout,
+		opts.Gateway.TLSTimeout,
+		opts.Gateway.Advertise,
+		opts.Gateway.ConnectRetries,
+		[]RemoteGatewayOptsVarz{{"B", 1, nil}},
+		opts.Gateway.RejectUnknown,
+	}
+	// Since URLs array is not guaranteed to be always the same order,
+	// we don't add it in the expected GatewayOptsVarz, instead we
+	// maintain here.
+	expectedURLs := []string{"localhost:1234", "localhost:1235"}
+
+	varzURL := fmt.Sprintf("http://127.0.0.1:%d/varz", s.MonitorAddr().Port)
+	for mode := 0; mode < 2; mode++ {
+		check := func(t *testing.T, v *Varz) {
+			t.Helper()
+			var urls []string
+			if len(v.Gateway.Gateways) == 1 {
+				urls = v.Gateway.Gateways[0].URLs
+				v.Gateway.Gateways[0].URLs = nil
+			}
+			if !reflect.DeepEqual(v.Gateway, expected) {
+				t.Fatalf("mode=%v - expected %+v, got %+v", mode, expected, v.Gateway)
+			}
+			// Now compare urls
+			for _, u := range expectedURLs {
+				ok := false
+				for _, u2 := range urls {
+					if u == u2 {
+						ok = true
+						break
+					}
+				}
+				if !ok {
+					t.Fatalf("mode=%v - expected urls to be %v, got %v", mode, expected.Gateways[0].URLs, urls)
+				}
+			}
+		}
+		v := pollVarz(t, s, mode, varzURL, nil)
+		check(t, v)
+
+		// Having this here to make sure that if fields are added in GatewayOptsVarz,
+		// we make sure to update this test (compiler will report an error if we don't)
+		_ = GatewayOptsVarz{"", "", 0, 0, 0, "", 0, []RemoteGatewayOptsVarz{{"", 0, nil}}, false}
+
+		// Alter the fields to make sure that we have a proper deep copy
+		// of what may be stored in the server. Anything we change here
+		// should not affect the next returned value.
+		v.Gateway.Name = "wrong"
+		v.Gateway.Host = "wrong"
+		v.Gateway.Port = 0
+		v.Gateway.AuthTimeout = 1234.5
+		v.Gateway.TLSTimeout = 1234.5
+		v.Gateway.Advertise = "wrong"
+		v.Gateway.ConnectRetries = 1234
+		v.Gateway.Gateways[0].Name = "wrong"
+		v.Gateway.Gateways[0].TLSTimeout = 1234.5
+		v.Gateway.Gateways[0].URLs = []string{"wrong"}
+		v.Gateway.RejectUnknown = true
+		v = pollVarz(t, s, mode, varzURL, nil)
+		check(t, v)
+	}
+}
+
+func TestMonitorGatewayURLsUpdated(t *testing.T) {
+	resetPreviousHTTPConnections()
+
+	ob1 := testDefaultOptionsForGateway("B")
+	sb1 := runGatewayServer(ob1)
+	defer sb1.Shutdown()
+
+	// Start a1 that has a single URL to sb1.
+	oa := testGatewayOptionsFromToWithServers(t, "A", "B", sb1)
+	oa.HTTPHost = "127.0.0.1"
+	oa.HTTPPort = MONITOR_PORT
+	sa := runGatewayServer(oa)
+	defer sa.Shutdown()
+
+	waitForOutboundGateways(t, sa, 1, 2*time.Second)
+
+	varzURL := fmt.Sprintf("http://127.0.0.1:%d/varz", sa.MonitorAddr().Port)
+	// Check the /varz gateway's URLs
+	for mode := 0; mode < 2; mode++ {
+		v := pollVarz(t, sa, mode, varzURL, nil)
+		if n := len(v.Gateway.Gateways); n != 1 {
+			t.Fatalf("mode=%v - Expected 1 remote gateway, got %v", mode, n)
+		}
+		gw := v.Gateway.Gateways[0]
+		if n := len(gw.URLs); n != 1 {
+			t.Fatalf("mode=%v - Expected 1 url, got %v", mode, n)
+		}
+		expected := oa.Gateway.Gateways[0].URLs[0].Host
+		if u := gw.URLs[0]; u != expected {
+			t.Fatalf("mode=%v - Expected URL %q, got %q", mode, expected, u)
+		}
+	}
+
+	// Now start sb2 that clusters with sb1. sa should add to its list of URLs
+	// sb2 gateway's connect URL.
+	ob2 := testDefaultOptionsForGateway("B")
+	ob2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", sb1.ClusterAddr().Port))
+	sb2 := runGatewayServer(ob2)
+	defer sb2.Shutdown()
+
+	// Wait for sb1 and sb2 to connect
+	checkClusterFormed(t, sb1, sb2)
+	// sb2 should be made aware of gateway A and connect to sa
+	waitForInboundGateways(t, sa, 2, 2*time.Second)
+	// Now check that URLs in /varz get updated
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		for mode := 0; mode < 2; mode++ {
+			v := pollVarz(t, sa, mode, varzURL, nil)
+			if n := len(v.Gateway.Gateways); n != 1 {
+				return fmt.Errorf("mode=%v - Expected 1 remote gateway, got %v", mode, n)
+			}
+			gw := v.Gateway.Gateways[0]
+			if n := len(gw.URLs); n != 2 {
+				return fmt.Errorf("mode=%v - Expected 2 urls, got %v", mode, n)
+			}
+
+			gotSB1 := false
+			gotSB2 := false
+			for _, u := range gw.URLs {
+				if u == fmt.Sprintf("127.0.0.1:%d", sb1.GatewayAddr().Port) {
+					gotSB1 = true
+				} else if u == fmt.Sprintf("127.0.0.1:%d", sb2.GatewayAddr().Port) {
+					gotSB2 = true
+				} else {
+					return fmt.Errorf("mode=%v - Incorrect URL to gateway B: %v", mode, u)
+				}
+			}
+			if !gotSB1 {
+				return fmt.Errorf("mode=%v - Did not get URL to sb1", mode)
+			}
+			if !gotSB2 {
+				return fmt.Errorf("mode=%v - Did not get URL to sb2", mode)
+			}
+		}
+		return nil
+	})
+}
+
+func TestMonitorLeafNode(t *testing.T) {
+	testMonitorStructPresent(t, "leaf")
+
+	resetPreviousHTTPConnections()
+	opts := DefaultMonitorOptions()
+	opts.LeafNode.Port = -1
+	opts.LeafNode.AuthTimeout = 1
+	opts.LeafNode.TLSTimeout = 1
+	opts.Accounts = []*Account{NewAccount("acc")}
+	u, _ := url.Parse("nats://ivan:pwd@localhost:1234")
+	opts.LeafNode.Remotes = []*RemoteLeafOpts{
+		&RemoteLeafOpts{
+			LocalAccount: "acc",
+			URLs:         []*url.URL{u},
+			TLSTimeout:   1,
+		},
+	}
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	expected := LeafNodeOptsVarz{
+		opts.LeafNode.Host,
+		opts.LeafNode.Port,
+		opts.LeafNode.AuthTimeout,
+		opts.LeafNode.TLSTimeout,
+		[]RemoteLeafOptsVarz{
+			{
+				"acc", 1, []string{"localhost:1234"},
+			},
+		},
+	}
+
+	varzURL := fmt.Sprintf("http://127.0.0.1:%d/varz", s.MonitorAddr().Port)
+
+	for mode := 0; mode < 2; mode++ {
+		check := func(t *testing.T, v *Varz) {
+			t.Helper()
+			if !reflect.DeepEqual(v.LeafNode, expected) {
+				t.Fatalf("mode=%v - expected %+v, got %+v", mode, expected, v.LeafNode)
+			}
+		}
+		v := pollVarz(t, s, mode, varzURL, nil)
+		check(t, v)
+
+		// Having this here to make sure that if fields are added in ClusterOptsVarz,
+		// we make sure to update this test (compiler will report an error if we don't)
+		_ = LeafNodeOptsVarz{"", 0, 0, 0, []RemoteLeafOptsVarz{{"", 0, nil}}}
+
+		// Alter the fields to make sure that we have a proper deep copy
+		// of what may be stored in the server. Anything we change here
+		// should not affect the next returned value.
+		v.LeafNode.Host = "wrong"
+		v.LeafNode.Port = 0
+		v.LeafNode.AuthTimeout = 1234.5
+		v.LeafNode.TLSTimeout = 1234.5
+		v.LeafNode.Remotes[0].LocalAccount = "wrong"
+		v.LeafNode.Remotes[0].URLs = append(v.LeafNode.Remotes[0].URLs, "wrong")
+		v.LeafNode.Remotes[0].TLSTimeout = 1234.5
+		v = pollVarz(t, s, mode, varzURL, nil)
+		check(t, v)
+	}
+}
+
+func pollGatewayz(t *testing.T, s *Server, mode int, url string, opts *GatewayzOptions) *Gatewayz {
+	t.Helper()
+	if mode == 0 {
+		g := &Gatewayz{}
+		body := readBody(t, url)
+		if err := json.Unmarshal(body, g); err != nil {
+			t.Fatalf("Got an error unmarshalling the body: %v\n", err)
+		}
+		return g
+	}
+	g, err := s.Gatewayz(opts)
+	if err != nil {
+		t.Fatalf("Error on Gatewayz: %v", err)
+	}
+	return g
+}
+
+func TestMonitorGatewayz(t *testing.T) {
+	resetPreviousHTTPConnections()
+
+	// First check that without gateway configured
+	s := runMonitorServer()
+	defer s.Shutdown()
+	url := fmt.Sprintf("http://127.0.0.1:%d/gatewayz", s.MonitorAddr().Port)
+	for pollMode := 0; pollMode < 2; pollMode++ {
+		g := pollGatewayz(t, s, pollMode, url, nil)
+		// Expect Name and port to be empty
+		if g.Name != _EMPTY_ || g.Port != 0 {
+			t.Fatalf("Expected no gateway, got %+v", g)
+		}
+	}
+	s.Shutdown()
+
+	ob1 := testDefaultOptionsForGateway("B")
+	sb1 := runGatewayServer(ob1)
+	defer sb1.Shutdown()
+
+	// Start a1 that has a single URL to sb1.
+	oa := testGatewayOptionsFromToWithServers(t, "A", "B", sb1)
+	oa.HTTPHost = "127.0.0.1"
+	oa.HTTPPort = MONITOR_PORT
+	sa := runGatewayServer(oa)
+	defer sa.Shutdown()
+
+	waitForOutboundGateways(t, sa, 1, 2*time.Second)
+	waitForInboundGateways(t, sa, 1, 2*time.Second)
+
+	waitForOutboundGateways(t, sb1, 1, 2*time.Second)
+	waitForInboundGateways(t, sb1, 1, 2*time.Second)
+
+	gatewayzURL := fmt.Sprintf("http://127.0.0.1:%d/gatewayz", sa.MonitorAddr().Port)
+	for pollMode := 0; pollMode < 2; pollMode++ {
+		g := pollGatewayz(t, sa, pollMode, gatewayzURL, nil)
+		if g.Host != oa.Gateway.Host {
+			t.Fatalf("mode=%v - Expected host to be %q, got %q", pollMode, oa.Gateway.Host, g.Host)
+		}
+		if g.Port != oa.Gateway.Port {
+			t.Fatalf("mode=%v - Expected port to be %v, got %v", pollMode, oa.Gateway.Port, g.Port)
+		}
+		if n := len(g.OutboundGateways); n != 1 {
+			t.Fatalf("mode=%v - Expected outbound to 1 gateway, got %v", pollMode, n)
+		}
+		if n := len(g.InboundGateways); n != 1 {
+			t.Fatalf("mode=%v - Expected inbound from 1 gateway, got %v", pollMode, n)
+		}
+		og := g.OutboundGateways["B"]
+		if og == nil {
+			t.Fatalf("mode=%v - Expected to find outbound connection to B, got none", pollMode)
+		}
+		if !og.IsConfigured {
+			t.Fatalf("mode=%v - Expected gw connection to be configured, was not", pollMode)
+		}
+		if og.Connection == nil {
+			t.Fatalf("mode=%v - Expected outbound connection to B to be set, wat not", pollMode)
+		}
+		if og.Connection.Name != sb1.ID() {
+			t.Fatalf("mode=%v - Expected outbound connection to B to have name %q, got %q", pollMode, sb1.ID(), og.Connection.Name)
+		}
+		if n := len(og.Accounts); n != 0 {
+			t.Fatalf("mode=%v - Expected no account, got %v", pollMode, n)
+		}
+		ig := g.InboundGateways["B"]
+		if ig == nil {
+			t.Fatalf("mode=%v - Expected to find inbound connection from B, got none", pollMode)
+		}
+		if n := len(ig); n != 1 {
+			t.Fatalf("mode=%v - Expected 1 inbound connection, got %v", pollMode, n)
+		}
+		igc := ig[0]
+		if igc.Connection == nil {
+			t.Fatalf("mode=%v - Expected inbound connection to B to be set, wat not", pollMode)
+		}
+		if igc.Connection.Name != sb1.ID() {
+			t.Fatalf("mode=%v - Expected inbound connection to B to have name %q, got %q", pollMode, sb1.ID(), igc.Connection.Name)
+		}
+	}
+
+	// Now start sb2 that clusters with sb1. sa should add to its list of URLs
+	// sb2 gateway's connect URL.
+	ob2 := testDefaultOptionsForGateway("B")
+	ob2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", sb1.ClusterAddr().Port))
+	sb2 := runGatewayServer(ob2)
+
+	// Wait for sb1 and sb2 to connect
+	checkClusterFormed(t, sb1, sb2)
+	// sb2 should be made aware of gateway A and connect to sa
+	waitForInboundGateways(t, sa, 2, 2*time.Second)
+	// Now check that URLs in /varz get updated
+	checkGatewayB := func(t *testing.T, url string, opts *GatewayzOptions) {
+		t.Helper()
+		checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+			for pollMode := 0; pollMode < 2; pollMode++ {
+				g := pollGatewayz(t, sa, pollMode, url, opts)
+				if n := len(g.OutboundGateways); n != 1 {
+					t.Fatalf("mode=%v - Expected outbound to 1 gateway, got %v", pollMode, n)
+				}
+				// The InboundGateways is a map with key the gateway names,
+				// then value is array of connections. So should be 1 here.
+				if n := len(g.InboundGateways); n != 1 {
+					t.Fatalf("mode=%v - Expected inbound from 1 gateway, got %v", pollMode, n)
+				}
+				ig := g.InboundGateways["B"]
+				if ig == nil {
+					t.Fatalf("mode=%v - Expected to find inbound connection from B, got none", pollMode)
+				}
+				if n := len(ig); n != 2 {
+					t.Fatalf("mode=%v - Expected 2 inbound connections from gateway B, got %v", pollMode, n)
+				}
+				gotSB1 := false
+				gotSB2 := false
+				for _, rg := range ig {
+					if rg.Connection != nil {
+						if rg.Connection.Name == sb1.ID() {
+							gotSB1 = true
+						} else if rg.Connection.Name == sb2.ID() {
+							gotSB2 = true
+						}
+					}
+				}
+				if !gotSB1 {
+					t.Fatalf("mode=%v - Missing inbound connection from sb1", pollMode)
+				}
+				if !gotSB2 {
+					t.Fatalf("mode=%v - Missing inbound connection from sb2", pollMode)
+				}
+			}
+			return nil
+		})
+	}
+	checkGatewayB(t, gatewayzURL, nil)
+
+	// Start a new cluser C that connects to B. A should see it as
+	// a non-configured gateway.
+	oc := testGatewayOptionsFromToWithServers(t, "C", "B", sb1)
+	sc := runGatewayServer(oc)
+	defer sc.Shutdown()
+
+	// All servers should have 2 outbound connections (one for each other cluster)
+	waitForOutboundGateways(t, sa, 2, 2*time.Second)
+	waitForOutboundGateways(t, sb1, 2, 2*time.Second)
+	waitForOutboundGateways(t, sb2, 2, 2*time.Second)
+	waitForOutboundGateways(t, sc, 2, 2*time.Second)
+
+	// Server sa should have 3 inbounds now
+	waitForInboundGateways(t, sa, 3, 2*time.Second)
+
+	// Check gatewayz again to see that we have C now.
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		for pollMode := 0; pollMode < 2; pollMode++ {
+			g := pollGatewayz(t, sa, pollMode, gatewayzURL, nil)
+			if n := len(g.OutboundGateways); n != 2 {
+				t.Fatalf("mode=%v - Expected outbound to 2 gateways, got %v", pollMode, n)
+			}
+			// The InboundGateways is a map with key the gateway names,
+			// then value is array of connections. So should be 2 here.
+			if n := len(g.InboundGateways); n != 2 {
+				t.Fatalf("mode=%v - Expected inbound from 2 gateways, got %v", pollMode, n)
+			}
+			og := g.OutboundGateways["C"]
+			if og == nil {
+				t.Fatalf("mode=%v - Expected to find outbound connection to C, got none", pollMode)
+			}
+			if og.IsConfigured {
+				t.Fatalf("mode=%v - Expected IsConfigured for gateway C to be false, was true", pollMode)
+			}
+			if og.Connection == nil {
+				t.Fatalf("mode=%v - Expected connection to C, got none", pollMode)
+			}
+			if og.Connection.Name != sc.ID() {
+				t.Fatalf("mode=%v - Expected outbound connection to C to have name %q, got %q", pollMode, sc.ID(), og.Connection.Name)
+			}
+			ig := g.InboundGateways["C"]
+			if ig == nil {
+				t.Fatalf("mode=%v - Expected to find inbound connection from C, got none", pollMode)
+			}
+			if n := len(ig); n != 1 {
+				t.Fatalf("mode=%v - Expected 1 inbound connections from gateway C, got %v", pollMode, n)
+			}
+			igc := ig[0]
+			if igc.Connection == nil {
+				t.Fatalf("mode=%v - Expected connection to C, got none", pollMode)
+			}
+			if igc.Connection.Name != sc.ID() {
+				t.Fatalf("mode=%v - Expected outbound connection to C to have name %q, got %q", pollMode, sc.ID(), og.Connection.Name)
+			}
+		}
+		return nil
+	})
+
+	// Select only 1 gateway by passing the name to option/url
+	opts := &GatewayzOptions{Name: "B"}
+	checkGatewayB(t, gatewayzURL+"?gw_name=B", opts)
+
+	// Stop gateway C and check that we have only B, with and without filter.
+	sc.Shutdown()
+	checkGatewayB(t, gatewayzURL+"?gw_name=B", opts)
+	checkGatewayB(t, gatewayzURL, nil)
+}
+
+func TestMonitorGatewayzAccounts(t *testing.T) {
+	resetPreviousHTTPConnections()
+
+	// Create bunch of Accounts
+	totalAccounts := 15
+	accounts := ""
+	for i := 0; i < totalAccounts; i++ {
+		acc := fmt.Sprintf("	acc_%d: { users=[{user:user_%d, password: pwd}] }\n", i, i)
+		accounts += acc
+	}
+
+	bConf := createConfFile(t, []byte(fmt.Sprintf(`
+		accounts {
+			%s
+		}
+		port: -1
+		http: -1
+		gateway: {
+			name: "B"
+			port: -1
+		}
+	`, accounts)))
+	defer os.Remove(bConf)
+
+	sb, ob := RunServerWithConfig(bConf)
+	defer sb.Shutdown()
+	sb.SetLogger(&DummyLogger{}, true, true)
+
+	// Start a1 that has a single URL to sb1.
+	aConf := createConfFile(t, []byte(fmt.Sprintf(`
+		accounts {
+			%s
+		}
+		port: -1
+		http: -1
+		gateway: {
+			name: "A"
+			port: -1
+			gateways [
+				{
+					name: "B"
+					url: "nats://127.0.0.1:%d"
+				}
+			]
+		}
+	`, accounts, sb.GatewayAddr().Port)))
+	defer os.Remove(aConf)
+
+	sa, oa := RunServerWithConfig(aConf)
+	defer sa.Shutdown()
+	sa.SetLogger(&DummyLogger{}, true, true)
+
+	waitForOutboundGateways(t, sa, 1, 2*time.Second)
+	waitForInboundGateways(t, sa, 1, 2*time.Second)
+	waitForOutboundGateways(t, sb, 1, 2*time.Second)
+	waitForInboundGateways(t, sb, 1, 2*time.Second)
+
+	// Create clients for each account on A and publish a message
+	// so that list of accounts appear in gatewayz
+	produceMsgsFromA := func(t *testing.T) {
+		t.Helper()
+		for i := 0; i < totalAccounts; i++ {
+			nc, err := nats.Connect(fmt.Sprintf("nats://user_%d:pwd@%s:%d", i, oa.Host, oa.Port))
+			if err != nil {
+				t.Fatalf("Error on connect: %v", err)
+			}
+			nc.Publish("foo", []byte("hello"))
+			nc.Flush()
+			nc.Close()
+		}
+	}
+	produceMsgsFromA(t)
+
+	// Wait for A- for all accounts
+	gwc := sa.getOutboundGatewayConnection("B")
+	for i := 0; i < totalAccounts; i++ {
+		checkForAccountNoInterest(t, gwc, fmt.Sprintf("acc_%d", i), true, 2*time.Second)
+	}
+
+	// Check accounts...
+	gatewayzURL := fmt.Sprintf("http://127.0.0.1:%d/gatewayz", sa.MonitorAddr().Port)
+	for pollMode := 0; pollMode < 2; pollMode++ {
+		// First, without asking for it, they should not be present.
+		g := pollGatewayz(t, sa, pollMode, gatewayzURL, nil)
+		og := g.OutboundGateways["B"]
+		if og == nil {
+			t.Fatalf("mode=%v - Expected outbound gateway to B, got none", pollMode)
+		}
+		if n := len(og.Accounts); n != 0 {
+			t.Fatalf("mode=%v - Expected accounts list to not be present by default, got %v", pollMode, n)
+		}
+		// Now ask for the accounts
+		g = pollGatewayz(t, sa, pollMode, gatewayzURL+"?accs=1", &GatewayzOptions{Accounts: true})
+		og = g.OutboundGateways["B"]
+		if og == nil {
+			t.Fatalf("mode=%v - Expected outbound gateway to B, got none", pollMode)
+		}
+		if n := len(og.Accounts); n != totalAccounts {
+			t.Fatalf("mode=%v - Expected to get all %d accounts, got %v", pollMode, totalAccounts, n)
+		}
+		// Now account details
+		for _, acc := range og.Accounts {
+			if acc.InterestMode != Optimistic.String() {
+				t.Fatalf("mode=%v - Expected optimistic mode, got %q", pollMode, acc.InterestMode)
+			}
+			// Since there is no interest at all on B, the publish
+			// will have resulted in total account no interest, so
+			// the number of no interest (subject wise) should be 0
+			if acc.NoInterestCount != 0 {
+				t.Fatalf("mode=%v - Expected 0 no-interest, got %v", pollMode, acc.NoInterestCount)
+			}
+			if acc.NumQueueSubscriptions != 0 || acc.TotalSubscriptions != 0 {
+				t.Fatalf("mode=%v - Expected total subs to be 0, got %v - and num queue subs to be 0, got %v",
+					pollMode, acc.TotalSubscriptions, acc.NumQueueSubscriptions)
+			}
+		}
+	}
+
+	// Check inbound on B
+	gwURLServerB := fmt.Sprintf("http://127.0.0.1:%d/gatewayz", sb.MonitorAddr().Port)
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		for pollMode := 0; pollMode < 2; pollMode++ {
+			// First, without asking for it, they should not be present.
+			g := pollGatewayz(t, sb, pollMode, gwURLServerB, nil)
+			igs := g.InboundGateways["A"]
+			if igs == nil {
+				return fmt.Errorf("mode=%v - Expected inbound gateway to A, got none", pollMode)
+			}
+			if len(igs) != 1 {
+				return fmt.Errorf("mode=%v - Expected single inbound, got %v", pollMode, len(igs))
+			}
+			ig := igs[0]
+			if n := len(ig.Accounts); n != 0 {
+				return fmt.Errorf("mode=%v - Expected no account, got %v", pollMode, n)
+			}
+			// Check that list of accounts
+			g = pollGatewayz(t, sb, pollMode, gwURLServerB+"?accs=1", &GatewayzOptions{Accounts: true})
+			igs = g.InboundGateways["A"]
+			if igs == nil {
+				return fmt.Errorf("mode=%v - Expected inbound gateway to A, got none", pollMode)
+			}
+			if len(igs) != 1 {
+				return fmt.Errorf("mode=%v - Expected single inbound, got %v", pollMode, len(igs))
+			}
+			ig = igs[0]
+			if ig.Connection == nil {
+				return fmt.Errorf("mode=%v - Expected inbound connection from A to be set, wat not", pollMode)
+			}
+			if ig.Connection.Name != sa.ID() {
+				t.Fatalf("mode=%v - Expected inbound connection from A to have name %q, got %q", pollMode, sa.ID(), ig.Connection.Name)
+			}
+			if n := len(ig.Accounts); n != totalAccounts {
+				return fmt.Errorf("mode=%v - Expected to get all %d accounts, got %v", pollMode, totalAccounts, n)
+			}
+			// Now account details
+			for _, acc := range ig.Accounts {
+				if acc.InterestMode != Optimistic.String() {
+					return fmt.Errorf("mode=%v - Expected optimistic mode, got %q", pollMode, acc.InterestMode)
+				}
+				// Since there is no interest at all on B, the publish
+				// will have resulted in total account no interest, so
+				// the number of no interest (subject wise) should be 0
+				if acc.NoInterestCount != 0 {
+					t.Fatalf("mode=%v - Expected 0 no-interest, got %v", pollMode, acc.NoInterestCount)
+				}
+				// For inbound gateway, NumQueueSubscriptions and TotalSubscriptions
+				// are not relevant.
+				if acc.NumQueueSubscriptions != 0 || acc.TotalSubscriptions != 0 {
+					return fmt.Errorf("mode=%v - For inbound connection, expected num queue subs and total subs to be 0, got %v and %v",
+						pollMode, acc.TotalSubscriptions, acc.NumQueueSubscriptions)
+				}
+			}
+		}
+		return nil
+	})
+
+	// Now create subscriptions on B to prevent A- and check on subject no interest
+	for i := 0; i < totalAccounts; i++ {
+		nc, err := nats.Connect(fmt.Sprintf("nats://user_%d:pwd@%s:%d", i, ob.Host, ob.Port))
+		if err != nil {
+			t.Fatalf("Error on connect: %v", err)
+		}
+		defer nc.Close()
+		// Create a queue sub so it shows up in gatewayz
+		nc.QueueSubscribeSync("bar", "queue")
+		// Create plain subscriptions on baz.0, baz.1 and baz.2.
+		// Create to for each subject. Since gateways will send
+		// only once per subject, the number of subs should be 3, not 6.
+		for j := 0; j < 3; j++ {
+			subj := fmt.Sprintf("baz.%d", j)
+			nc.SubscribeSync(subj)
+			nc.SubscribeSync(subj)
+		}
+		nc.Flush()
+	}
+
+	for i := 0; i < totalAccounts; i++ {
+		accName := fmt.Sprintf("acc_%d", i)
+		checkForRegisteredQSubInterest(t, sa, "B", accName, "bar", 1, 2*time.Second)
+	}
+
+	// Resend msgs from A on foo, on all accounts. There will be no interest on this subject.
+	produceMsgsFromA(t)
+
+	for i := 0; i < totalAccounts; i++ {
+		accName := fmt.Sprintf("acc_%d", i)
+		checkForSubjectNoInterest(t, gwc, accName, "foo", true, 2*time.Second)
+		// Verify that we still have the queue interest registered
+		checkForRegisteredQSubInterest(t, sa, "B", accName, "bar", 1, 2*time.Second)
+	}
+
+	// Check accounts...
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		for pollMode := 0; pollMode < 2; pollMode++ {
+			g := pollGatewayz(t, sa, pollMode, gatewayzURL+"?accs=1", &GatewayzOptions{Accounts: true})
+			og := g.OutboundGateways["B"]
+			if og == nil {
+				return fmt.Errorf("mode=%v - Expected outbound gateway to B, got none", pollMode)
+			}
+			if n := len(og.Accounts); n != totalAccounts {
+				return fmt.Errorf("mode=%v - Expected to get all %d accounts, got %v", pollMode, totalAccounts, n)
+			}
+			// Now account details
+			for _, acc := range og.Accounts {
+				if acc.InterestMode != Optimistic.String() {
+					return fmt.Errorf("mode=%v - Expected optimistic mode, got %q", pollMode, acc.InterestMode)
+				}
+				if acc.NoInterestCount != 1 {
+					return fmt.Errorf("mode=%v - Expected 1 no-interest, got %v", pollMode, acc.NoInterestCount)
+				}
+				if acc.NumQueueSubscriptions != 1 || acc.TotalSubscriptions != 1 {
+					return fmt.Errorf("mode=%v - Expected total subs to be 1, got %v - and num queue subs to be 1, got %v",
+						pollMode, acc.TotalSubscriptions, acc.NumQueueSubscriptions)
+				}
+			}
+		}
+		return nil
+	})
+
+	// Check inbound on server B
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		for pollMode := 0; pollMode < 2; pollMode++ {
+			// Ask for accounts list
+			g := pollGatewayz(t, sb, pollMode, gwURLServerB+"?accs=1", &GatewayzOptions{Accounts: true})
+			igs := g.InboundGateways["A"]
+			if igs == nil {
+				return fmt.Errorf("mode=%v - Expected inbound gateway to A, got none", pollMode)
+			}
+			if len(igs) != 1 {
+				return fmt.Errorf("mode=%v - Expected single inbound, got %v", pollMode, len(igs))
+			}
+			ig := igs[0]
+			if ig.Connection == nil {
+				return fmt.Errorf("mode=%v - Expected inbound connection from A to be set, wat not", pollMode)
+			}
+			if ig.Connection.Name != sa.ID() {
+				t.Fatalf("mode=%v - Expected inbound connection from A to have name %q, got %q", pollMode, sa.ID(), ig.Connection.Name)
+			}
+			if n := len(ig.Accounts); n != totalAccounts {
+				return fmt.Errorf("mode=%v - Expected to get all %d accounts, got %v", pollMode, totalAccounts, n)
+			}
+			// Now account details
+			for _, acc := range ig.Accounts {
+				if acc.InterestMode != Optimistic.String() {
+					return fmt.Errorf("mode=%v - Expected optimistic mode, got %q", pollMode, acc.InterestMode)
+				}
+				if acc.NoInterestCount != 1 {
+					return fmt.Errorf("mode=%v - Expected 1 no-interest, got %v", pollMode, acc.NoInterestCount)
+				}
+				// For inbound gateway, NumQueueSubscriptions and TotalSubscriptions
+				// are not relevant.
+				if acc.NumQueueSubscriptions != 0 || acc.TotalSubscriptions != 0 {
+					return fmt.Errorf("mode=%v - For inbound connection, expected num queue subs and total subs to be 0, got %v and %v",
+						pollMode, acc.TotalSubscriptions, acc.NumQueueSubscriptions)
+				}
+			}
+		}
+		return nil
+	})
+
+	// Make one of the account to switch to interest only
+	nc, err := nats.Connect(fmt.Sprintf("nats://user_1:pwd@%s:%d", oa.Host, oa.Port))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc.Close()
+	for i := 0; i < 1100; i++ {
+		nc.Publish(fmt.Sprintf("foo.%d", i), []byte("hello"))
+	}
+	nc.Flush()
+	nc.Close()
+
+	// Check that we can select single account
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		for pollMode := 0; pollMode < 2; pollMode++ {
+			g := pollGatewayz(t, sa, pollMode, gatewayzURL+"?gw_name=B&acc_name=acc_1", &GatewayzOptions{Name: "B", AccountName: "acc_1"})
+			og := g.OutboundGateways["B"]
+			if og == nil {
+				return fmt.Errorf("mode=%v - Expected outbound gateway to B, got none", pollMode)
+			}
+			if n := len(og.Accounts); n != 1 {
+				return fmt.Errorf("mode=%v - Expected to get 1 account, got %v", pollMode, n)
+			}
+			// Now account details
+			acc := og.Accounts[0]
+			if acc.InterestMode != InterestOnly.String() {
+				return fmt.Errorf("mode=%v - Expected interest-only mode, got %q", pollMode, acc.InterestMode)
+			}
+			// Since we switched, this should be set to 0
+			if acc.NoInterestCount != 0 {
+				return fmt.Errorf("mode=%v - Expected 0 no-interest, got %v", pollMode, acc.NoInterestCount)
+			}
+			// We have created 3 subs on that account on B, and 1 queue sub.
+			// So total should be 4 and 1 for queue sub.
+			if acc.NumQueueSubscriptions != 1 {
+				return fmt.Errorf("mode=%v - Expected num queue subs to be 1, got %v",
+					pollMode, acc.NumQueueSubscriptions)
+			}
+			if acc.TotalSubscriptions != 4 {
+				return fmt.Errorf("mode=%v - Expected total subs to be 4, got %v",
+					pollMode, acc.TotalSubscriptions)
+			}
+		}
+		return nil
+	})
+
+	// Check inbound on B now...
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		for pollMode := 0; pollMode < 2; pollMode++ {
+			g := pollGatewayz(t, sb, pollMode, gwURLServerB+"?gw_name=A&acc_name=acc_1", &GatewayzOptions{Name: "A", AccountName: "acc_1"})
+			igs := g.InboundGateways["A"]
+			if igs == nil {
+				return fmt.Errorf("mode=%v - Expected inbound gateway from A, got none", pollMode)
+			}
+			if len(igs) != 1 {
+				return fmt.Errorf("mode=%v - Expected single inbound, got %v", pollMode, len(igs))
+			}
+			ig := igs[0]
+			if n := len(ig.Accounts); n != 1 {
+				return fmt.Errorf("mode=%v - Expected to get 1 account, got %v", pollMode, n)
+			}
+			// Now account details
+			acc := ig.Accounts[0]
+			if acc.InterestMode != InterestOnly.String() {
+				return fmt.Errorf("mode=%v - Expected interest-only mode, got %q", pollMode, acc.InterestMode)
+			}
+			if acc.InterestMode != InterestOnly.String() {
+				return fmt.Errorf("Should be in %q mode, got %q", InterestOnly.String(), acc.InterestMode)
+			}
+			// Since we switched, this should be set to 0
+			if acc.NoInterestCount != 0 {
+				return fmt.Errorf("mode=%v - Expected 0 no-interest, got %v", pollMode, acc.NoInterestCount)
+			}
+			// Again, for inbound, these should be always 0.
+			if acc.NumQueueSubscriptions != 0 || acc.TotalSubscriptions != 0 {
+				return fmt.Errorf("mode=%v - For inbound connection, expected num queue subs and total subs to be 0, got %v and %v",
+					pollMode, acc.TotalSubscriptions, acc.NumQueueSubscriptions)
+			}
+		}
+		return nil
+	})
+}
+
+func TestMonitorRouteRTT(t *testing.T) {
+	// Do not change default PingInterval and expect RTT
+	// to still be reported
+
+	ob := DefaultOptions()
+	sb := RunServer(ob)
+	defer sb.Shutdown()
+
+	oa := DefaultOptions()
+	oa.Routes = RoutesFromStr(fmt.Sprintf("nats://%s:%d", ob.Cluster.Host, ob.Cluster.Port))
+	sa := RunServer(oa)
+	defer sa.Shutdown()
+
+	checkClusterFormed(t, sa, sb)
+
+	checkRouteInfo := func(t *testing.T, s *Server) {
+		t.Helper()
+		routezURL := fmt.Sprintf("http://127.0.0.1:%d/routez", s.MonitorAddr().Port)
+		for pollMode := 0; pollMode < 2; pollMode++ {
+			checkFor(t, 2*firstPingInterval, 15*time.Millisecond, func() error {
+				rz := pollRoutez(t, s, pollMode, routezURL, nil)
+				if len(rz.Routes) != 1 {
+					return fmt.Errorf("Expected 1 route, got %v", len(rz.Routes))
+				}
+				ri := rz.Routes[0]
+				if ri.RTT == _EMPTY_ {
+					return fmt.Errorf("Route's RTT not reported")
+				}
+				return nil
+			})
+		}
+	}
+	checkRouteInfo(t, sa)
+	checkRouteInfo(t, sb)
+}
+
+func pollLeafz(t *testing.T, s *Server, mode int, url string, opts *LeafzOptions) *Leafz {
+	t.Helper()
+	if mode == 0 {
+		l := &Leafz{}
+		body := readBody(t, url)
+		if err := json.Unmarshal(body, l); err != nil {
+			t.Fatalf("Got an error unmarshalling the body: %v\n", err)
+		}
+		return l
+	}
+	l, err := s.Leafz(opts)
+	if err != nil {
+		t.Fatalf("Error on Leafz: %v", err)
+	}
+	return l
+}
+
+func TestMonitorLeafz(t *testing.T) {
+	content := `
+	listen: "127.0.0.1:-1"
+	http: "127.0.0.1:-1"
+	operator = "../test/configs/nkeys/op.jwt"
+	resolver = MEMORY
+	ping_interval = 1
+	leafnodes {
+		listen: "127.0.0.1:-1"
+	}
+	`
+	conf := createConfFile(t, []byte(content))
+	defer os.Remove(conf)
+	sb, ob := RunServerWithConfig(conf)
+	defer sb.Shutdown()
+
+	createAcc := func(t *testing.T) (*Account, string) {
+		t.Helper()
+		acc, akp := createAccount(sb)
+		kp, _ := nkeys.CreateUser()
+		pub, _ := kp.PublicKey()
+		nuc := jwt.NewUserClaims(pub)
+		ujwt, err := nuc.Encode(akp)
+		if err != nil {
+			t.Fatalf("Error generating user JWT: %v", err)
+		}
+		seed, _ := kp.Seed()
+		creds := genCredsFile(t, ujwt, seed)
+		return acc, creds
+	}
+	acc1, mycreds1 := createAcc(t)
+	defer os.Remove(mycreds1)
+	acc2, mycreds2 := createAcc(t)
+	defer os.Remove(mycreds2)
+
+	content = `
+		port: -1
+		http: "127.0.0.1:-1"
+		ping_interval = 1
+		accounts {
+			%s {
+				users [
+					{user: user1, password: pwd}
+				]
+			}
+			%s {
+				users [
+					{user: user2, password: pwd}
+				]
+			}
+		}
+		leafnodes {
+			remotes = [
+				{
+					account: "%s"
+					url: nats-leaf://127.0.0.1:%d
+					credentials: "%s"
+				}
+				{
+					account: "%s"
+					url: nats-leaf://127.0.0.1:%d
+					credentials: "%s"
+				}
+			]
+		}
+		`
+	config := fmt.Sprintf(content,
+		acc1.Name, acc2.Name,
+		acc1.Name, ob.LeafNode.Port, mycreds1,
+		acc2.Name, ob.LeafNode.Port, mycreds2)
+	conf = createConfFile(t, []byte(config))
+	defer os.Remove(conf)
+	sa, oa := RunServerWithConfig(conf)
+	defer sa.Shutdown()
+
+	checkFor(t, time.Second, 15*time.Millisecond, func() error {
+		if n := sa.NumLeafNodes(); n != 2 {
+			return fmt.Errorf("Expected 2 leaf connections, got %v", n)
+		}
+		return nil
+	})
+
+	// Wait for initial RTT to be computed
+	time.Sleep(firstPingInterval + 500*time.Millisecond)
+
+	ch := make(chan bool, 1)
+	nc1B := natsConnect(t, fmt.Sprintf("nats://127.0.0.1:%d", ob.Port), nats.UserCredentials(mycreds1))
+	defer nc1B.Close()
+	natsSub(t, nc1B, "foo", func(_ *nats.Msg) { ch <- true })
+	natsSub(t, nc1B, "bar", func(_ *nats.Msg) {})
+	natsFlush(t, nc1B)
+
+	nc2B := natsConnect(t, fmt.Sprintf("nats://127.0.0.1:%d", ob.Port), nats.UserCredentials(mycreds2))
+	defer nc2B.Close()
+	natsSub(t, nc2B, "bar", func(_ *nats.Msg) { ch <- true })
+	natsSub(t, nc2B, "foo", func(_ *nats.Msg) {})
+	natsFlush(t, nc2B)
+
+	nc1A := natsConnect(t, fmt.Sprintf("nats://user1:pwd@127.0.0.1:%d", oa.Port))
+	defer nc1A.Close()
+	natsPub(t, nc1A, "foo", []byte("hello"))
+	natsFlush(t, nc1A)
+
+	waitCh(t, ch, "Did not get the message")
+
+	nc2A := natsConnect(t, fmt.Sprintf("nats://user2:pwd@127.0.0.1:%d", oa.Port))
+	defer nc2A.Close()
+	natsPub(t, nc2A, "bar", []byte("hello"))
+	natsPub(t, nc2A, "bar", []byte("hello"))
+	natsFlush(t, nc2A)
+
+	waitCh(t, ch, "Did not get the message")
+	waitCh(t, ch, "Did not get the message")
+
+	// Let's poll server A
+	pollURL := fmt.Sprintf("http://127.0.0.1:%d/leafz?subs=1", sa.MonitorAddr().Port)
+	for pollMode := 1; pollMode < 2; pollMode++ {
+		l := pollLeafz(t, sa, pollMode, pollURL, &LeafzOptions{Subscriptions: true})
+		if l.ID != sa.ID() {
+			t.Fatalf("Expected ID to be %q, got %q", sa.ID(), l.ID)
+		}
+		if l.Now.IsZero() {
+			t.Fatalf("Expected Now to be set, was not")
+		}
+		if l.NumLeafs != 2 {
+			t.Fatalf("Expected NumLeafs to be 2, got %v", l.NumLeafs)
+		}
+		if len(l.Leafs) != 2 {
+			t.Fatalf("Expected array to be len 2, got %v", len(l.Leafs))
+		}
+		for _, ln := range l.Leafs {
+			if ln.Account == acc1.Name {
+				if ln.OutMsgs != 1 || ln.OutBytes == 0 || ln.InMsgs != 0 || ln.InBytes != 0 {
+					t.Fatalf("Expected 1 OutMsgs/Bytes and 0 InMsgs/Bytes, got %+v", ln)
+				}
+			} else if ln.Account == acc2.Name {
+				if ln.OutMsgs != 2 || ln.OutBytes == 0 || ln.InMsgs != 0 || ln.InBytes != 0 {
+					t.Fatalf("Expected 2 OutMsgs/Bytes and 0 InMsgs/Bytes, got %+v", ln)
+				}
+			} else {
+				t.Fatalf("Expected account to be %q or %q, got %q", acc1.Name, acc2.Name, ln.Account)
+			}
+			if ln.RTT == "" {
+				t.Fatalf("RTT not tracked?")
+			}
+			if ln.NumSubs != 2 {
+				t.Fatalf("Expected 2 subs, got %v", ln.NumSubs)
+			}
+			if len(ln.Subs) != 2 {
+				t.Fatalf("Expected subs to be returned, got %v", len(ln.Subs))
+			}
+			if (ln.Subs[0] != "foo" || ln.Subs[1] != "bar") && (ln.Subs[0] != "bar" || ln.Subs[1] != "foo") {
+				t.Fatalf("Unexpected subjects: %v", ln.Subs)
+			}
+		}
+	}
+	// Make sure that if we don't ask for subs, we don't get them
+	pollURL = fmt.Sprintf("http://127.0.0.1:%d/leafz", sa.MonitorAddr().Port)
+	for pollMode := 1; pollMode < 2; pollMode++ {
+		l := pollLeafz(t, sa, pollMode, pollURL, nil)
+		for _, ln := range l.Leafs {
+			if ln.NumSubs != 2 {
+				t.Fatalf("Number of subs should be 2, got %v", ln.NumSubs)
+			}
+			if len(ln.Subs) != 0 {
+				t.Fatalf("Subs should not have been returned, got %v", ln.Subs)
+			}
+		}
+	}
+
+	// Now polling server B.
+	pollURL = fmt.Sprintf("http://127.0.0.1:%d/leafz?subs=1", sb.MonitorAddr().Port)
+	for pollMode := 1; pollMode < 2; pollMode++ {
+		l := pollLeafz(t, sb, pollMode, pollURL, &LeafzOptions{Subscriptions: true})
+		if l.ID != sb.ID() {
+			t.Fatalf("Expected ID to be %q, got %q", sb.ID(), l.ID)
+		}
+		if l.Now.IsZero() {
+			t.Fatalf("Expected Now to be set, was not")
+		}
+		if l.NumLeafs != 2 {
+			t.Fatalf("Expected NumLeafs to be 1, got %v", l.NumLeafs)
+		}
+		if len(l.Leafs) != 2 {
+			t.Fatalf("Expected array to be len 2, got %v", len(l.Leafs))
+		}
+		for _, ln := range l.Leafs {
+			if ln.Account == acc1.Name {
+				if ln.OutMsgs != 0 || ln.OutBytes != 0 || ln.InMsgs != 1 || ln.InBytes == 0 {
+					t.Fatalf("Expected 1 InMsgs/Bytes and 0 OutMsgs/Bytes, got %+v", ln)
+				}
+			} else if ln.Account == acc2.Name {
+				if ln.OutMsgs != 0 || ln.OutBytes != 0 || ln.InMsgs != 2 || ln.InBytes == 0 {
+					t.Fatalf("Expected 2 InMsgs/Bytes and 0 OutMsgs/Bytes, got %+v", ln)
+				}
+			} else {
+				t.Fatalf("Expected account to be %q or %q, got %q", acc1.Name, acc2.Name, ln.Account)
+			}
+			if ln.RTT == "" {
+				t.Fatalf("RTT not tracked?")
+			}
+			if ln.NumSubs != 0 || len(ln.Subs) != 0 {
+				t.Fatalf("Did not expect sub, got %v (%v)", ln.NumSubs, ln.Subs)
+			}
 		}
 	}
 }

@@ -18,6 +18,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math"
 	"net"
 	"reflect"
 	"regexp"
@@ -30,7 +32,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 
-	"github.com/nats-io/go-nats"
+	"github.com/nats-io/nats.go"
 )
 
 type serverInfo struct {
@@ -58,7 +60,7 @@ func newClientForServer(s *Server) (*client, *bufio.Reader, string) {
 	ch := make(chan *client)
 	createClientAsync(ch, s, srv)
 	// So failing tests don't just hang.
-	cli.SetReadDeadline(time.Now().Add(2 * time.Second))
+	cli.SetReadDeadline(time.Now().Add(10 * time.Second))
 	l, _ := cr.ReadString('\n')
 	// Grab client
 	c := <-ch
@@ -66,6 +68,7 @@ func newClientForServer(s *Server) (*client, *bufio.Reader, string) {
 }
 
 var defaultServerOptions = Options{
+	Host:   "127.0.0.1",
 	Trace:  false,
 	Debug:  false,
 	NoLog:  true,
@@ -295,7 +298,7 @@ func TestClientPing(t *testing.T) {
 	}
 }
 
-var msgPat = regexp.MustCompile(`\AMSG\s+([^\s]+)\s+([^\s]+)\s+(([^\s]+)[^\S\r\n]+)?(\d+)\r\n`)
+var msgPat = regexp.MustCompile(`MSG\s+([^\s]+)\s+([^\s]+)\s+(([^\s]+)[^\S\r\n]+)?(\d+)\r\n`)
 
 const (
 	SUB_INDEX   = 1
@@ -303,6 +306,13 @@ const (
 	REPLY_INDEX = 4
 	LEN_INDEX   = 5
 )
+
+func grabPayload(cr *bufio.Reader, expected int) []byte {
+	d := make([]byte, expected)
+	n, _ := cr.Read(d)
+	cr.ReadString('\n')
+	return d[:n]
+}
 
 func checkPayload(cr *bufio.Reader, expected []byte, t *testing.T) {
 	t.Helper()
@@ -473,6 +483,189 @@ func TestClientPubWithQueueSub(t *testing.T) {
 	// Threshold for randomness for now
 	if n1 < 20 || n2 < 20 {
 		t.Fatalf("Received wrong # of msgs per subscriber: %d - %d\n", n1, n2)
+	}
+}
+
+func TestSplitSubjectQueue(t *testing.T) {
+	cases := []struct {
+		name        string
+		sq          string
+		wantSubject []byte
+		wantQueue   []byte
+		wantErr     bool
+	}{
+		{name: "single subject",
+			sq: "foo", wantSubject: []byte("foo"), wantQueue: nil},
+		{name: "subject and queue",
+			sq: "foo bar", wantSubject: []byte("foo"), wantQueue: []byte("bar")},
+		{name: "subject and queue with surrounding spaces",
+			sq: " foo bar ", wantSubject: []byte("foo"), wantQueue: []byte("bar")},
+		{name: "subject and queue with extra spaces in the middle",
+			sq: "foo  bar", wantSubject: []byte("foo"), wantQueue: []byte("bar")},
+		{name: "subject, queue, and extra token",
+			sq: "foo  bar fizz", wantSubject: []byte(nil), wantQueue: []byte(nil), wantErr: true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			sub, que, err := splitSubjectQueue(c.sq)
+			if err == nil && c.wantErr {
+				t.Fatal("Expected error, but got nil")
+			}
+			if err != nil && !c.wantErr {
+				t.Fatalf("Expected nil error, but got %v", err)
+			}
+
+			if !reflect.DeepEqual(sub, c.wantSubject) {
+				t.Fatalf("Expected to get subject %#v, but instead got %#v", c.wantSubject, sub)
+			}
+			if !reflect.DeepEqual(que, c.wantQueue) {
+				t.Fatalf("Expected to get queue %#v, but instead got %#v", c.wantQueue, que)
+			}
+		})
+	}
+}
+
+func TestQueueSubscribePermissions(t *testing.T) {
+	cases := []struct {
+		name    string
+		perms   *SubjectPermission
+		subject string
+		queue   string
+		want    string
+	}{
+		{
+			name:    "plain subscription on foo",
+			perms:   &SubjectPermission{Allow: []string{"foo"}},
+			subject: "foo",
+			want:    "+OK\r\n",
+		},
+		{
+			name:    "queue subscribe with allowed group",
+			perms:   &SubjectPermission{Allow: []string{"foo bar"}},
+			subject: "foo",
+			queue:   "bar",
+			want:    "+OK\r\n",
+		},
+		{
+			name:    "queue subscribe with wildcard allowed group",
+			perms:   &SubjectPermission{Allow: []string{"foo bar.*"}},
+			subject: "foo",
+			queue:   "bar.fizz",
+			want:    "+OK\r\n",
+		},
+		{
+			name:    "queue subscribe with full wildcard subject and subgroup",
+			perms:   &SubjectPermission{Allow: []string{"> bar.>"}},
+			subject: "whizz",
+			queue:   "bar.bang",
+			want:    "+OK\r\n",
+		},
+		{
+			name:    "plain subscribe with full wildcard subject and subgroup",
+			perms:   &SubjectPermission{Allow: []string{"> bar.>"}},
+			subject: "whizz",
+			want:    "-ERR 'Permissions Violation for Subscription to \"whizz\"'\r\n",
+		},
+		{
+			name:    "deny plain subscription on foo",
+			perms:   &SubjectPermission{Allow: []string{">"}, Deny: []string{"foo"}},
+			subject: "foo",
+			queue:   "bar",
+			want:    "-ERR 'Permissions Violation for Subscription to \"foo\" using queue \"bar\"'\r\n",
+		},
+		{
+			name:    "allow plain subscription, except foo",
+			perms:   &SubjectPermission{Allow: []string{">"}, Deny: []string{"foo"}},
+			subject: "bar",
+			want:    "+OK\r\n",
+		},
+		{
+			name:    "deny everything",
+			perms:   &SubjectPermission{Allow: []string{">"}, Deny: []string{">"}},
+			subject: "foo",
+			queue:   "bar",
+			want:    "-ERR 'Permissions Violation for Subscription to \"foo\" using queue \"bar\"'\r\n",
+		},
+		{
+			name:    "can only subscribe to queues v1",
+			perms:   &SubjectPermission{Allow: []string{"> v1.>"}},
+			subject: "foo",
+			queue:   "v1.prod",
+			want:    "+OK\r\n",
+		},
+		{
+			name:    "cannot subscribe to queues, plain subscribe ok",
+			perms:   &SubjectPermission{Allow: []string{">"}, Deny: []string{"> >"}},
+			subject: "foo",
+			want:    "+OK\r\n",
+		},
+		{
+			name:    "cannot subscribe to queues, queue subscribe not ok",
+			perms:   &SubjectPermission{Deny: []string{"> >"}},
+			subject: "foo",
+			queue:   "bar",
+			want:    "-ERR 'Permissions Violation for Subscription to \"foo\" using queue \"bar\"'\r\n",
+		},
+		{
+			name:    "deny all queue subscriptions on dev or stg only",
+			perms:   &SubjectPermission{Deny: []string{"> *.dev", "> *.stg"}},
+			subject: "foo",
+			queue:   "bar",
+			want:    "+OK\r\n",
+		},
+		{
+			name:    "allow only queue subscription on dev or stg",
+			perms:   &SubjectPermission{Allow: []string{"> *.dev", "> *.stg"}},
+			subject: "foo",
+			queue:   "bar",
+			want:    "-ERR 'Permissions Violation for Subscription to \"foo\" using queue \"bar\"'\r\n",
+		},
+		{
+			name:    "deny queue subscriptions with subject foo",
+			perms:   &SubjectPermission{Deny: []string{"foo >"}},
+			subject: "foo",
+			queue:   "bar",
+			want:    "-ERR 'Permissions Violation for Subscription to \"foo\" using queue \"bar\"'\r\n",
+		},
+		{
+			name:    "plain sub is allowed, but queue subscribe with queue not in list",
+			perms:   &SubjectPermission{Allow: []string{"foo bar"}},
+			subject: "foo",
+			queue:   "fizz",
+			want:    "-ERR 'Permissions Violation for Subscription to \"foo\" using queue \"fizz\"'\r\n",
+		},
+		{
+			name:    "allow plain sub, but do queue subscribe",
+			perms:   &SubjectPermission{Allow: []string{"foo"}},
+			subject: "foo",
+			queue:   "bar",
+			want:    "+OK\r\n",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, client, r := setupClient()
+
+			client.RegisterUser(&User{
+				Permissions: &Permissions{Subscribe: c.perms},
+			})
+			connect := []byte("CONNECT {\"verbose\":true}\r\n")
+			qsub := []byte(fmt.Sprintf("SUB %s %s 1\r\n", c.subject, c.queue))
+
+			go client.parseFlushAndClose(append(connect, qsub...))
+
+			var buf bytes.Buffer
+			if _, err := io.Copy(&buf, r); err != nil {
+				t.Fatal(err)
+			}
+
+			// Extra OK is from the successful CONNECT.
+			want := "+OK\r\n" + c.want
+			if got := buf.String(); got != want {
+				t.Fatalf("Expected to receive %q, but instead received %q", want, got)
+			}
+		})
 	}
 }
 
@@ -1227,5 +1420,215 @@ func TestClientUserInfo(t *testing.T) {
 	expected = `User "N/A"`
 	if got != expected {
 		t.Errorf("Expected %q, got %q", expected, got)
+	}
+}
+
+type captureWarnLogger struct {
+	DummyLogger
+	warn chan string
+}
+
+func (l *captureWarnLogger) Warnf(format string, v ...interface{}) {
+	select {
+	case l.warn <- fmt.Sprintf(format, v...):
+	default:
+	}
+}
+
+type pauseWriteConn struct {
+	net.Conn
+}
+
+func (swc *pauseWriteConn) Write(b []byte) (int, error) {
+	time.Sleep(250 * time.Millisecond)
+	return swc.Conn.Write(b)
+}
+
+func TestReadloopWarning(t *testing.T) {
+	readLoopReportThreshold = 100 * time.Millisecond
+	defer func() { readLoopReportThreshold = readLoopReport }()
+
+	opts := DefaultOptions()
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	l := &captureWarnLogger{warn: make(chan string, 1)}
+	s.SetLogger(l, false, false)
+
+	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
+	nc := natsConnect(t, url)
+	defer nc.Close()
+	natsSubSync(t, nc, "foo")
+	cid, _ := nc.GetClientID()
+
+	sender := natsConnect(t, url)
+	defer sender.Close()
+
+	c := s.getClient(cid)
+	c.mu.Lock()
+	c.nc = &pauseWriteConn{Conn: c.nc}
+	c.mu.Unlock()
+
+	natsPub(t, nc, "foo", make([]byte, 100))
+	natsFlush(t, nc)
+
+	select {
+	case warn := <-l.warn:
+		if !strings.Contains(warn, "Readloop") {
+			t.Fatalf("unexpected warning: %v", warn)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("No warning printed")
+	}
+}
+
+func TestTraceMsg(t *testing.T) {
+	c := &client{}
+	// Enable message trace
+	c.trace = true
+
+	cases := []struct {
+		Desc            string
+		Msg             []byte
+		Wanted          string
+		MaxTracedMsgLen int
+	}{
+		{
+			Desc:            "normal length",
+			Msg:             []byte(fmt.Sprintf("normal%s", CR_LF)),
+			Wanted:          " - <<- MSG_PAYLOAD: [\"normal\"]",
+			MaxTracedMsgLen: 10,
+		},
+		{
+			Desc:            "over length",
+			Msg:             []byte(fmt.Sprintf("over length%s", CR_LF)),
+			Wanted:          " - <<- MSG_PAYLOAD: [\"over lengt...\"]",
+			MaxTracedMsgLen: 10,
+		},
+		{
+			Desc:            "unlimited length",
+			Msg:             []byte(fmt.Sprintf("unlimited length%s", CR_LF)),
+			Wanted:          " - <<- MSG_PAYLOAD: [\"unlimited length\"]",
+			MaxTracedMsgLen: 0,
+		},
+		{
+			Desc:            "negative max traced msg len",
+			Msg:             []byte(fmt.Sprintf("negative max traced msg len%s", CR_LF)),
+			Wanted:          " - <<- MSG_PAYLOAD: [\"negative max traced msg len\"]",
+			MaxTracedMsgLen: -1,
+		},
+	}
+
+	for _, ut := range cases {
+		c.srv = &Server{
+			opts: &Options{MaxTracedMsgLen: ut.MaxTracedMsgLen},
+		}
+		c.srv.SetLogger(&DummyLogger{}, true, true)
+
+		c.traceMsg(ut.Msg)
+
+		got := c.srv.logging.logger.(*DummyLogger).msg
+		if !reflect.DeepEqual(ut.Wanted, got) {
+			t.Errorf("Desc: %s. Msg %q. Traced msg want: %s, got: %s", ut.Desc, ut.Msg, ut.Wanted, got)
+		}
+	}
+}
+
+func TestClientMaxPending(t *testing.T) {
+	opts := DefaultOptions()
+	opts.MaxPending = math.MaxInt32 + 1
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	nc := natsConnect(t, fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port))
+	defer nc.Close()
+
+	sub := natsSubSync(t, nc, "foo")
+	natsPub(t, nc, "foo", []byte("msg"))
+	natsNexMsg(t, sub, 100*time.Millisecond)
+}
+
+func TestResponsePermissions(t *testing.T) {
+	for i, test := range []struct {
+		name  string
+		perms *ResponsePermission
+	}{
+		{"max_msgs", &ResponsePermission{MaxMsgs: 2, Expires: time.Hour}},
+		{"no_expire_limit", &ResponsePermission{MaxMsgs: 3, Expires: -1 * time.Millisecond}},
+		{"expire", &ResponsePermission{MaxMsgs: 1000, Expires: 100 * time.Millisecond}},
+		{"no_msgs_limit", &ResponsePermission{MaxMsgs: -1, Expires: 100 * time.Millisecond}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			opts := DefaultOptions()
+			u1 := &User{
+				Username:    "service",
+				Password:    "pwd",
+				Permissions: &Permissions{Response: test.perms},
+			}
+			u2 := &User{Username: "ivan", Password: "pwd"}
+			opts.Users = []*User{u1, u2}
+			s := RunServer(opts)
+			defer s.Shutdown()
+
+			svcNC := natsConnect(t, fmt.Sprintf("nats://service:pwd@%s:%d", opts.Host, opts.Port))
+			defer svcNC.Close()
+			reqSub := natsSubSync(t, svcNC, "request")
+
+			nc := natsConnect(t, fmt.Sprintf("nats://ivan:pwd@%s:%d", opts.Host, opts.Port))
+			defer nc.Close()
+
+			replySub := natsSubSync(t, nc, "reply")
+
+			natsPubReq(t, nc, "request", "reply", []byte("req1"))
+
+			req1 := natsNexMsg(t, reqSub, 100*time.Millisecond)
+
+			checkFailed := func(t *testing.T) {
+				t.Helper()
+				if reply, err := replySub.NextMsg(100 * time.Millisecond); err != nats.ErrTimeout {
+					if reply != nil {
+						t.Fatalf("Expected to receive timeout, got reply=%q", reply.Data)
+					} else {
+						t.Fatalf("Unexpected error: %v", err)
+					}
+				}
+			}
+
+			switch i {
+			case 0:
+				// Should allow only 2 replies...
+				for i := 0; i < 10; i++ {
+					natsPub(t, svcNC, req1.Reply, []byte("reply"))
+				}
+				natsNexMsg(t, replySub, 100*time.Millisecond)
+				natsNexMsg(t, replySub, 100*time.Millisecond)
+				// The next should fail...
+				checkFailed(t)
+			case 1:
+				// Expiration is set to -1ms, which should count as infinite...
+				natsPub(t, svcNC, req1.Reply, []byte("reply"))
+				// Sleep a bit before next send
+				time.Sleep(50 * time.Millisecond)
+				natsPub(t, svcNC, req1.Reply, []byte("reply"))
+				// Make sure we receive both
+				natsNexMsg(t, replySub, 100*time.Millisecond)
+				natsNexMsg(t, replySub, 100*time.Millisecond)
+			case 2:
+				fallthrough
+			case 3:
+				// Expire set to 100ms so make sure we wait more between
+				// next publish
+				natsPub(t, svcNC, req1.Reply, []byte("reply"))
+				time.Sleep(200 * time.Millisecond)
+				natsPub(t, svcNC, req1.Reply, []byte("reply"))
+				// Should receive one, and fail on the other
+				natsNexMsg(t, replySub, 100*time.Millisecond)
+				checkFailed(t)
+			}
+			// When testing expiration, sleep before sending next reply
+			if i >= 2 {
+				time.Sleep(400 * time.Millisecond)
+			}
+		})
 	}
 }

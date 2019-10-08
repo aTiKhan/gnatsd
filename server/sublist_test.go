@@ -1,4 +1,4 @@
-// Copyright 2016-2018 The NATS Authors
+// Copyright 2016-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -115,12 +115,12 @@ func newRemoteQSub(subject, queue string, num int32) *subscription {
 }
 
 func TestSublistInit(t *testing.T) {
-	s := NewSublist()
+	s := NewSublistWithCache()
 	verifyCount(s, 0, t)
 }
 
 func TestSublistInsertCount(t *testing.T) {
-	testSublistInsertCount(t, NewSublist())
+	testSublistInsertCount(t, NewSublistWithCache())
 }
 
 func TestSublistInsertCountNoCache(t *testing.T) {
@@ -135,7 +135,7 @@ func testSublistInsertCount(t *testing.T, s *Sublist) {
 }
 
 func TestSublistSimple(t *testing.T) {
-	testSublistSimple(t, NewSublist())
+	testSublistSimple(t, NewSublistWithCache())
 }
 
 func TestSublistSimpleNoCache(t *testing.T) {
@@ -152,7 +152,7 @@ func testSublistSimple(t *testing.T, s *Sublist) {
 }
 
 func TestSublistSimpleMultiTokens(t *testing.T) {
-	testSublistSimpleMultiTokens(t, NewSublist())
+	testSublistSimpleMultiTokens(t, NewSublistWithCache())
 }
 
 func TestSublistSimpleMultiTokensNoCache(t *testing.T) {
@@ -169,7 +169,7 @@ func testSublistSimpleMultiTokens(t *testing.T, s *Sublist) {
 }
 
 func TestSublistPartialWildcard(t *testing.T) {
-	testSublistPartialWildcard(t, NewSublist())
+	testSublistPartialWildcard(t, NewSublistWithCache())
 }
 
 func TestSublistPartialWildcardNoCache(t *testing.T) {
@@ -188,7 +188,7 @@ func testSublistPartialWildcard(t *testing.T, s *Sublist) {
 }
 
 func TestSublistPartialWildcardAtEnd(t *testing.T) {
-	testSublistPartialWildcardAtEnd(t, NewSublist())
+	testSublistPartialWildcardAtEnd(t, NewSublistWithCache())
 }
 
 func TestSublistPartialWildcardAtEndNoCache(t *testing.T) {
@@ -207,7 +207,7 @@ func testSublistPartialWildcardAtEnd(t *testing.T, s *Sublist) {
 }
 
 func TestSublistFullWildcard(t *testing.T) {
-	testSublistFullWildcard(t, NewSublist())
+	testSublistFullWildcard(t, NewSublistWithCache())
 }
 
 func TestSublistFullWildcardNoCache(t *testing.T) {
@@ -226,7 +226,7 @@ func testSublistFullWildcard(t *testing.T, s *Sublist) {
 }
 
 func TestSublistRemove(t *testing.T) {
-	testSublistRemove(t, NewSublist())
+	testSublistRemove(t, NewSublistWithCache())
 }
 
 func TestSublistRemoveNoCache(t *testing.T) {
@@ -249,7 +249,7 @@ func testSublistRemove(t *testing.T, s *Sublist) {
 }
 
 func TestSublistRemoveWildcard(t *testing.T) {
-	testSublistRemoveWildcard(t, NewSublist())
+	testSublistRemoveWildcard(t, NewSublistWithCache())
 }
 
 func TestSublistRemoveWildcardNoCache(t *testing.T) {
@@ -278,7 +278,7 @@ func testSublistRemoveWildcard(t *testing.T, s *Sublist) {
 }
 
 func TestSublistRemoveCleanup(t *testing.T) {
-	testSublistRemoveCleanup(t, NewSublist())
+	testSublistRemoveCleanup(t, NewSublistWithCache())
 }
 
 func TestSublistRemoveCleanupNoCache(t *testing.T) {
@@ -297,7 +297,7 @@ func testSublistRemoveCleanup(t *testing.T, s *Sublist) {
 }
 
 func TestSublistRemoveCleanupWildcards(t *testing.T) {
-	testSublistRemoveCleanupWildcards(t, NewSublist())
+	testSublistRemoveCleanupWildcards(t, NewSublistWithCache())
 }
 
 func TestSublistRemoveCleanupWildcardsNoCache(t *testing.T) {
@@ -316,7 +316,7 @@ func testSublistRemoveCleanupWildcards(t *testing.T, s *Sublist) {
 }
 
 func TestSublistRemoveWithLargeSubs(t *testing.T) {
-	testSublistRemoveWithLargeSubs(t, NewSublist())
+	testSublistRemoveWithLargeSubs(t, NewSublistWithCache())
 }
 
 func TestSublistRemoveWithLargeSubsNoCache(t *testing.T) {
@@ -343,7 +343,7 @@ func testSublistRemoveWithLargeSubs(t *testing.T, s *Sublist) {
 }
 
 func TestSublistRemoveByClient(t *testing.T) {
-	testSublistRemoveByClient(t, NewSublist())
+	testSublistRemoveByClient(t, NewSublistWithCache())
 }
 
 func TestSublistRemoveByClientNoCache(t *testing.T) {
@@ -380,7 +380,7 @@ func testSublistRemoveByClient(t *testing.T, s *Sublist) {
 }
 
 func TestSublistInvalidSubjectsInsert(t *testing.T) {
-	testSublistInvalidSubjectsInsert(t, NewSublist())
+	testSublistInvalidSubjectsInsert(t, NewSublistWithCache())
 }
 
 func TestSublistInvalidSubjectsInsertNoCache(t *testing.T) {
@@ -415,7 +415,7 @@ func testSublistInvalidSubjectsInsert(t *testing.T, s *Sublist) {
 }
 
 func TestSublistCache(t *testing.T) {
-	s := NewSublist()
+	s := NewSublistWithCache()
 
 	// Test add a remove logistics
 	subject := "a.b.c.d"
@@ -457,7 +457,7 @@ func TestSublistCache(t *testing.T) {
 	})
 
 	// Test that adding to a wildcard properly adds to the cache.
-	s = NewSublist()
+	s = NewSublistWithCache()
 	s.Insert(newSub("foo.*"))
 	s.Insert(newSub("foo.bar"))
 	r = s.Match("foo.baz")
@@ -470,7 +470,7 @@ func TestSublistCache(t *testing.T) {
 }
 
 func TestSublistBasicQueueResults(t *testing.T) {
-	testSublistBasicQueueResults(t, NewSublist())
+	testSublistBasicQueueResults(t, NewSublistWithCache())
 }
 
 func TestSublistBasicQueueResultsNoCache(t *testing.T) {
@@ -666,7 +666,7 @@ func TestSubjectIsLiteral(t *testing.T) {
 }
 
 func TestSublistBadSubjectOnRemove(t *testing.T) {
-	testSublistBadSubjectOnRemove(t, NewSublist())
+	testSublistBadSubjectOnRemove(t, NewSublistWithCache())
 }
 
 func TestSublistBadSubjectOnRemoveNoCache(t *testing.T) {
@@ -693,7 +693,7 @@ func testSublistBadSubjectOnRemove(t *testing.T, s *Sublist) {
 
 // This is from bug report #18
 func TestSublistTwoTokenPubMatchSingleTokenSub(t *testing.T) {
-	testSublistTwoTokenPubMatchSingleTokenSub(t, NewSublist())
+	testSublistTwoTokenPubMatchSingleTokenSub(t, NewSublistWithCache())
 }
 
 func TestSublistTwoTokenPubMatchSingleTokenSubNoCache(t *testing.T) {
@@ -711,7 +711,7 @@ func testSublistTwoTokenPubMatchSingleTokenSub(t *testing.T, s *Sublist) {
 }
 
 func TestSublistInsertWithWildcardsAsLiterals(t *testing.T) {
-	testSublistInsertWithWildcardsAsLiterals(t, NewSublist())
+	testSublistInsertWithWildcardsAsLiterals(t, NewSublistWithCache())
 }
 
 func TestSublistInsertWithWildcardsAsLiteralsNoCache(t *testing.T) {
@@ -733,7 +733,7 @@ func testSublistInsertWithWildcardsAsLiterals(t *testing.T, s *Sublist) {
 }
 
 func TestSublistRemoveWithWildcardsAsLiterals(t *testing.T) {
-	testSublistRemoveWithWildcardsAsLiterals(t, NewSublist())
+	testSublistRemoveWithWildcardsAsLiterals(t, NewSublistWithCache())
 }
 
 func TestSublistRemoveWithWildcardsAsLiteralsNoCache(t *testing.T) {
@@ -759,7 +759,7 @@ func testSublistRemoveWithWildcardsAsLiterals(t *testing.T, s *Sublist) {
 }
 
 func TestSublistRaceOnRemove(t *testing.T) {
-	testSublistRaceOnRemove(t, NewSublist())
+	testSublistRaceOnRemove(t, NewSublistWithCache())
 }
 
 func TestSublistRaceOnRemoveNoCache(t *testing.T) {
@@ -840,7 +840,7 @@ func testSublistRaceOnRemove(t *testing.T, s *Sublist) {
 }
 
 func TestSublistRaceOnInsert(t *testing.T) {
-	testSublistRaceOnInsert(t, NewSublist())
+	testSublistRaceOnInsert(t, NewSublistWithCache())
 }
 
 func TestSublistRaceOnInsertNoCache(t *testing.T) {
@@ -942,7 +942,7 @@ func TestSublistRaceOnMatch(t *testing.T) {
 // Remote subscriptions for queue subscribers will be weighted such that a single subscription
 // is received, but represents all of the queue subscribers on the remote side.
 func TestSublistRemoteQueueSubscriptions(t *testing.T) {
-	testSublistRemoteQueueSubscriptions(t, NewSublist())
+	testSublistRemoteQueueSubscriptions(t, NewSublistWithCache())
 }
 
 func TestSublistRemoteQueueSubscriptionsNoCache(t *testing.T) {
@@ -993,7 +993,7 @@ func testSublistRemoteQueueSubscriptions(t *testing.T, s *Sublist) {
 }
 
 func TestSublistSharedEmptyResult(t *testing.T) {
-	s := NewSublist()
+	s := NewSublistWithCache()
 	r1 := s.Match("foo")
 	verifyLen(r1.psubs, 0, t)
 	verifyQLen(r1.qsubs, 0, t)
@@ -1007,10 +1007,45 @@ func TestSublistSharedEmptyResult(t *testing.T) {
 	}
 }
 
+func TestSublistNoCacheStats(t *testing.T) {
+	s := NewSublistNoCache()
+	s.Insert(newSub("foo"))
+	s.Insert(newSub("bar"))
+	s.Insert(newSub("baz"))
+	s.Insert(newSub("foo.bar.baz"))
+	s.Match("a.b.c")
+	s.Match("bar")
+	stats := s.Stats()
+	if stats.NumCache != 0 {
+		t.Fatalf("Expected 0 for NumCache stat, got %d", stats.NumCache)
+	}
+}
+
+func TestSublistAll(t *testing.T) {
+	s := NewSublistNoCache()
+	subs := []*subscription{
+		newSub("foo.bar.baz"),
+		newSub("foo"),
+		newSub("baz"),
+	}
+	// alter client's kind
+	subs[0].client.kind = LEAF
+	for _, sub := range subs {
+		s.Insert(sub)
+	}
+
+	var buf [32]*subscription
+	output := buf[:0]
+	s.All(&output)
+	if len(output) != len(subs) {
+		t.Fatalf("Expected %d for All, got %d", len(subs), len(output))
+	}
+}
+
 // -- Benchmarks Setup --
 
 var benchSublistSubs []*subscription
-var benchSublistSl = NewSublist()
+var benchSublistSl = NewSublistWithCache()
 
 func init() {
 	initSublist := false
@@ -1055,7 +1090,7 @@ func addWildcards() {
 // -- Benchmarks Setup End --
 
 func Benchmark______________________SublistInsert(b *testing.B) {
-	s := NewSublist()
+	s := NewSublistWithCache()
 	for i, l := 0, len(benchSublistSubs); i < b.N; i++ {
 		index := i % l
 		s.Insert(benchSublistSubs[index])
@@ -1189,7 +1224,7 @@ func Benchmark_____SublistMatch10kSubsWithNoCache(b *testing.B) {
 }
 
 func removeTest(b *testing.B, singleSubject, doBatch bool, qgroup string) {
-	s := NewSublist()
+	s := NewSublistWithCache()
 	subject := "foo"
 
 	subs := make([]*subscription, 0, b.N)
@@ -1240,7 +1275,7 @@ func Benchmark_________SublistRemove1TokenQGBatch(b *testing.B) {
 }
 
 func removeMultiTest(b *testing.B, singleSubject, doBatch bool) {
-	s := NewSublist()
+	s := NewSublistWithCache()
 	subject := "foo"
 	var swg, fwg sync.WaitGroup
 	swg.Add(b.N)
@@ -1315,7 +1350,7 @@ func cacheContentionTest(b *testing.B, numMatchers, numAdders, numRemovers int) 
 	quitCh := make(chan struct{})
 
 	// Set up a new sublist. subjects will be foo.bar.baz.N
-	s := NewSublist()
+	s := NewSublistWithCache()
 	mu.Lock()
 	for i := 0; i < 10000; i++ {
 		sub := newSub(fmt.Sprintf("foo.bar.baz.%d", i))

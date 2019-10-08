@@ -1,4 +1,4 @@
-// Copyright 2017-2018 The NATS Authors
+// Copyright 2017-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -30,9 +30,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
-
-	"github.com/nats-io/go-nats"
 )
 
 func newServerWithConfig(t *testing.T, configFile string) (*Server, *Options, string) {
@@ -249,8 +248,8 @@ func TestConfigReloadInvalidConfig(t *testing.T) {
 func TestConfigReload(t *testing.T) {
 	server, opts, config := runReloadServerWithConfig(t, "./configs/reload/test.conf")
 	defer os.Remove(config)
-	defer os.Remove("gnatsd.pid")
-	defer os.Remove("gnatsd.log")
+	defer os.Remove("nats-server.pid")
+	defer os.Remove("nats-server.log")
 	defer server.Shutdown()
 
 	dir := filepath.Dir(config)
@@ -320,8 +319,8 @@ func TestConfigReload(t *testing.T) {
 			t.Fatalf("RemoteSyslog is incorrect.\nexpected: udp://127.0.0.1:514\ngot: %s", updated.RemoteSyslog)
 		}
 	}
-	if updated.LogFile != "gnatsd.log" {
-		t.Fatalf("LogFile is incorrect.\nexpected: gnatsd.log\ngot: %s", updated.LogFile)
+	if updated.LogFile != "nats-server.log" {
+		t.Fatalf("LogFile is incorrect.\nexpected: nats-server.log\ngot: %s", updated.LogFile)
 	}
 	if updated.TLSConfig == nil {
 		t.Fatal("Expected TLSConfig to be non-nil")
@@ -347,8 +346,8 @@ func TestConfigReload(t *testing.T) {
 	if !updated.Cluster.NoAdvertise {
 		t.Fatal("Expected NoAdvertise to be true")
 	}
-	if updated.PidFile != "gnatsd.pid" {
-		t.Fatalf("PidFile is incorrect.\nexpected: gnatsd.pid\ngot: %s", updated.PidFile)
+	if updated.PidFile != "nats-server.pid" {
+		t.Fatalf("PidFile is incorrect.\nexpected: nats-server.pid\ngot: %s", updated.PidFile)
 	}
 	if updated.MaxControlLine != 512 {
 		t.Fatalf("MaxControlLine is incorrect.\nexpected: 512\ngot: %d", updated.MaxControlLine)
@@ -1939,9 +1938,9 @@ func TestConfigReloadRotateFiles(t *testing.T) {
 	defer func() {
 		os.Remove(config)
 		os.Remove("log.txt")
-		os.Remove("gnatsd.pid")
+		os.Remove("nats-server.pid")
 		os.Remove("log1.txt")
-		os.Remove("gnatsd1.pid")
+		os.Remove("nats-server1.pid")
 	}()
 	defer server.Shutdown()
 
@@ -1960,7 +1959,7 @@ func TestConfigReloadRotateFiles(t *testing.T) {
 	if _, err := os.Stat("log1.txt"); os.IsNotExist(err) {
 		t.Fatalf("Error reloading config, no new file: %v", err)
 	}
-	if _, err := os.Stat("gnatsd1.pid"); os.IsNotExist(err) {
+	if _, err := os.Stat("nats-server1.pid"); os.IsNotExist(err) {
 		t.Fatalf("Error reloading config, no new file: %v", err)
 	}
 
@@ -1968,7 +1967,7 @@ func TestConfigReloadRotateFiles(t *testing.T) {
 	if err := os.Rename("log.txt", "log_old.txt"); err != nil {
 		t.Fatalf("Error reloading config, cannot rename file: %v", err)
 	}
-	if err := os.Rename("gnatsd.pid", "gnatsd_old.pid"); err != nil {
+	if err := os.Rename("nats-server.pid", "nats-server_old.pid"); err != nil {
 		t.Fatalf("Error reloading config, cannot rename file: %v", err)
 	}
 
@@ -1976,7 +1975,7 @@ func TestConfigReloadRotateFiles(t *testing.T) {
 	if err := os.Remove("log_old.txt"); err != nil {
 		t.Fatalf("Error reloading config, cannot delete file: %v", err)
 	}
-	if err := os.Remove("gnatsd_old.pid"); err != nil {
+	if err := os.Remove("nats-server_old.pid"); err != nil {
 		t.Fatalf("Error reloading config, cannot delete file: %v", err)
 	}
 }
@@ -3758,4 +3757,150 @@ func TestConfigReloadLeafNodeWithTLS(t *testing.T) {
 	if err := s1.Reload(); err != nil {
 		t.Fatalf("Error during reload: %v", err)
 	}
+}
+
+func TestConfigReloadAndVarz(t *testing.T) {
+	template := `
+		port: -1
+		%s
+	`
+	conf := createConfFile(t, []byte(fmt.Sprintf(template, "")))
+	defer os.Remove(conf)
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	s.mu.Lock()
+	initConfigTime := s.configTime
+	s.mu.Unlock()
+
+	v, _ := s.Varz(nil)
+	if !v.ConfigLoadTime.Equal(initConfigTime) {
+		t.Fatalf("ConfigLoadTime should be %v, got %v", initConfigTime, v.ConfigLoadTime)
+	}
+	if v.MaxConn != DEFAULT_MAX_CONNECTIONS {
+		t.Fatalf("MaxConn should be %v, got %v", DEFAULT_MAX_CONNECTIONS, v.MaxConn)
+	}
+
+	changeCurrentConfigContentWithNewContent(t, conf, []byte(fmt.Sprintf(template, "max_connections: 10")))
+
+	// Make sure we wait a bit so config load time has a chance to change.
+	time.Sleep(15 * time.Millisecond)
+
+	if err := s.Reload(); err != nil {
+		t.Fatalf("Error during reload: %v", err)
+	}
+
+	v, _ = s.Varz(nil)
+	if v.ConfigLoadTime.Equal(initConfigTime) {
+		t.Fatalf("ConfigLoadTime should be different from %v", initConfigTime)
+	}
+	if v.MaxConn != 10 {
+		t.Fatalf("MaxConn should be 10, got %v", v.MaxConn)
+	}
+}
+
+func TestConfigReloadConnectErrReports(t *testing.T) {
+	template := `
+		port: -1
+		%s
+		%s
+	`
+	conf := createConfFile(t, []byte(fmt.Sprintf(template, "", "")))
+	defer os.Remove(conf)
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	opts := s.getOpts()
+	if cer := opts.ConnectErrorReports; cer != DEFAULT_CONNECT_ERROR_REPORTS {
+		t.Fatalf("Expected ConnectErrorReports to be %v, got %v", DEFAULT_CONNECT_ERROR_REPORTS, cer)
+	}
+	if rer := opts.ReconnectErrorReports; rer != DEFAULT_RECONNECT_ERROR_REPORTS {
+		t.Fatalf("Expected ReconnectErrorReports to be %v, got %v", DEFAULT_RECONNECT_ERROR_REPORTS, rer)
+	}
+
+	changeCurrentConfigContentWithNewContent(t, conf,
+		[]byte(fmt.Sprintf(template, "connect_error_reports: 2", "reconnect_error_reports: 3")))
+
+	if err := s.Reload(); err != nil {
+		t.Fatalf("Error during reload: %v", err)
+	}
+
+	opts = s.getOpts()
+	if cer := opts.ConnectErrorReports; cer != 2 {
+		t.Fatalf("Expected ConnectErrorReports to be %v, got %v", 2, cer)
+	}
+	if rer := opts.ReconnectErrorReports; rer != 3 {
+		t.Fatalf("Expected ReconnectErrorReports to be %v, got %v", 3, rer)
+	}
+}
+
+func TestAuthReloadDoesNotBreakRouteInterest(t *testing.T) {
+	s, opts := RunServerWithConfig("./configs/seed_tls.conf")
+	defer s.Shutdown()
+
+	// Create client and sub interest on seed server.
+	urlSeed := fmt.Sprintf("nats://%s:%d/", opts.Host, opts.Port)
+	nc, err := nats.Connect(urlSeed)
+	if err != nil {
+		t.Fatalf("Error creating client: %v\n", err)
+	}
+	defer nc.Close()
+
+	ch := make(chan bool)
+	nc.Subscribe("foo", func(m *nats.Msg) { ch <- true })
+	nc.Flush()
+
+	// Use this to check for message.
+	checkForMsg := func() {
+		select {
+		case <-ch:
+		case <-time.After(2 * time.Second):
+			t.Fatal("Timeout waiting for message across route")
+		}
+	}
+
+	// Create second server and form cluster. We will send from here.
+	urlRoute := fmt.Sprintf("nats://%s:%d", opts.Cluster.Host, opts.Cluster.Port)
+	optsA := nextServerOpts(opts)
+	optsA.Routes = RoutesFromStr(urlRoute)
+
+	sa := RunServer(optsA)
+	defer sa.Shutdown()
+
+	checkClusterFormed(t, s, sa)
+
+	// Create second client and send message from this one. Interest should be here.
+	urlA := fmt.Sprintf("nats://%s:%d/", optsA.Host, optsA.Port)
+	nc2, err := nats.Connect(urlA)
+	if err != nil {
+		t.Fatalf("Error creating client: %v\n", err)
+	}
+	defer nc2.Close()
+
+	// Check that we can send messages.
+	nc2.Publish("foo", nil)
+	checkForMsg()
+
+	// Now shutdown nc2 and srvA.
+	nc2.Close()
+	sa.Shutdown()
+
+	// Now force reload on seed server of auth.
+	s.reloadAuthorization()
+
+	// Restart both server A and client 2.
+	sa = RunServer(optsA)
+	defer sa.Shutdown()
+
+	checkClusterFormed(t, s, sa)
+
+	nc2, err = nats.Connect(urlA)
+	if err != nil {
+		t.Fatalf("Error creating client: %v\n", err)
+	}
+	defer nc2.Close()
+
+	// Check that we can still send messages.
+	nc2.Publish("foo", nil)
+	checkForMsg()
 }

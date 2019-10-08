@@ -1,4 +1,4 @@
-// Copyright 2012-2018 The NATS Authors
+// Copyright 2012-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -25,8 +25,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/gnatsd/server"
-	"github.com/nats-io/go-nats"
+	"github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats.go"
 )
 
 const clientProtoInfo = 1
@@ -62,7 +62,8 @@ func TestSendRouteInfoOnConnect(t *testing.T) {
 	rc := createRouteConn(t, opts.Cluster.Host, opts.Cluster.Port)
 	defer rc.Close()
 
-	routeSend, routeExpect := setupRoute(t, rc, opts)
+	routeID := "RouteID"
+	routeSend, routeExpect := setupRouteEx(t, rc, opts, routeID)
 	buf := routeExpect(infoRe)
 
 	info := server.Info{}
@@ -80,7 +81,7 @@ func TestSendRouteInfoOnConnect(t *testing.T) {
 
 	// Need to send a different INFO than the one received, otherwise the server
 	// will detect as a "cycle" and close the connection.
-	info.ID = "RouteID"
+	info.ID = routeID
 	b, err := json.Marshal(info)
 	if err != nil {
 		t.Fatalf("Could not marshal test route info: %v", err)

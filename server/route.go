@@ -92,12 +92,17 @@ const (
 	InfoProto = "INFO %s" + _CRLF_
 )
 
-// Used to decide if the sending of the route SUBs list should be
-// done in place or in separate go routine.
-const sendRouteSubsInGoRoutineThreshold = 1024 * 1024 // 1MB
+const (
+	// Used to decide if the sending of the route SUBs list should be
+	// done in place or in separate go routine.
+	sendRouteSubsInGoRoutineThreshold = 1024 * 1024 // 1MB
 
-// Warning when user configures cluster TLS insecure
-const clusterTLSInsecureWarning = "TLS Hostname verification disabled, system will not verify identity of the solicited route"
+	// Warning when user configures cluster TLS insecure
+	clusterTLSInsecureWarning = "TLS certificate chain and hostname of solicited routes will not be verified. DO NOT USE IN PRODUCTION!"
+)
+
+// Can be changed for tests
+var routeConnectDelay = DEFAULT_ROUTE_CONNECT
 
 // This will add a timer to watch over remote reply subjects in case
 // they fail to receive a response. The duration will be taken from the
@@ -113,7 +118,7 @@ func (c *client) addReplySubTimeout(acc *Account, sub *subscription, d time.Dura
 		delete(rs, sub)
 		sub.max = 0
 		c.mu.Unlock()
-		c.unsubscribe(acc, sub, true)
+		c.unsubscribe(acc, sub, true, true)
 	})
 }
 
@@ -302,8 +307,8 @@ func (c *client) processInboundRoutedMsg(msg []byte) {
 	c.processMsgResults(acc, r, msg, c.pa.subject, c.pa.reply, pmrNoFlag)
 }
 
-// Helper function for routes and gateways to create qfilters need for
-// converted subs from imports, etc.
+// Helper function for routes and gateways and leafnodes to create qfilters
+// needed for converted subs from imports, etc.
 func (c *client) makeQFilter(qsubs [][]*subscription) {
 	qs := make([][]byte, 0, len(qsubs))
 	for _, qsub := range qsubs {
@@ -583,7 +588,7 @@ func (s *Server) processImplicitRoute(info *Info) {
 	if info.AuthRequired {
 		r.User = url.UserPassword(opts.Cluster.Username, opts.Cluster.Password)
 	}
-	s.startGoRoutine(func() { s.connectToRoute(r, false) })
+	s.startGoRoutine(func() { s.connectToRoute(r, false, true) })
 }
 
 // hasThisRouteConfigured returns true if info.Host:info.Port is present
@@ -624,7 +629,7 @@ func (s *Server) forwardNewRouteInfoToKnownServers(info *Info) {
 func (c *client) canImport(subject string) bool {
 	// Use pubAllowed() since this checks Publish permissions which
 	// is what Import maps to.
-	return c.pubAllowed(subject)
+	return c.pubAllowedFullCheck(subject, false)
 }
 
 // canExport is whether or not we will accept a SUB from the remote for a given subject.
@@ -709,11 +714,8 @@ func (c *client) parseUnsubProto(arg []byte) (string, []byte, []byte, error) {
 	c.in.subs++
 
 	args := splitArg(arg)
-	var (
-		accountName string
-		subject     []byte
-		queue       []byte
-	)
+	var queue []byte
+
 	switch len(args) {
 	case 2:
 	case 3:
@@ -721,9 +723,7 @@ func (c *client) parseUnsubProto(arg []byte) (string, []byte, []byte, error) {
 	default:
 		return "", nil, nil, fmt.Errorf("parse error: '%s'", arg)
 	}
-	subject = args[1]
-	accountName = string(args[0])
-	return accountName, subject, queue, nil
+	return string(args[0]), args[1], queue, nil
 }
 
 // Indicates no more interest in the given account/subject for the remote side.
@@ -916,7 +916,12 @@ func (s *Server) sendSubsToRoute(route *client) {
 			a.mu.RLock()
 			c := a.randomClient()
 			if c == nil {
+				nsubs := len(a.rm)
+				accName := a.Name
 				a.mu.RUnlock()
+				if nsubs > 0 {
+					route.Warnf("Ignoring account %q with %d subs, no clients", accName, nsubs)
+				}
 				continue
 			}
 			for key, n := range a.rm {
@@ -933,14 +938,10 @@ func (s *Server) sendSubsToRoute(route *client) {
 				// efficient with these tmp subs.
 				sub := &subscription{client: c, subject: subj, queue: qn, qw: n}
 				subs = append(subs, sub)
-
 			}
 			a.mu.RUnlock()
 
-			closed = route.sendRouteSubProtos(subs, false, func(sub *subscription) bool {
-				return route.canImport(string(sub.subject))
-			})
-
+			closed = route.sendRouteSubProtos(subs, false, route.importFilter)
 			if closed {
 				route.mu.Unlock()
 				return
@@ -1171,7 +1172,7 @@ func (s *Server) createRoute(conn net.Conn, rURL *url.URL) *client {
 	}
 
 	// Set the Ping timer
-	c.setPingTimer()
+	s.setFirstPingTimer(c)
 
 	// For routes, the "client" is added to s.routes only when processing
 	// the INFO protocol, that is much later.
@@ -1273,6 +1274,11 @@ func (s *Server) addRoute(c *client, info *Info) (bool, bool) {
 			rs := *c.route
 			r = &rs
 		}
+		// Since this duplicate route is going to be removed, make sure we clear
+		// c.route.leafnodeURL, otherwise, when processing the disconnect, this
+		// would cause the leafnode URL for that remote server to be removed
+		// from our list.
+		c.route.leafnodeURL = _EMPTY_
 		c.mu.Unlock()
 
 		remote.mu.Lock()
@@ -1293,18 +1299,15 @@ func (s *Server) addRoute(c *client, info *Info) (bool, bool) {
 	return !exists, sendInfo
 }
 
+// Import filter check.
+func (c *client) importFilter(sub *subscription) bool {
+	return c.canImport(string(sub.subject))
+}
+
 // updateRouteSubscriptionMap will make sure to update the route map for the subscription. Will
 // also forward to all routes if needed.
 func (s *Server) updateRouteSubscriptionMap(acc *Account, sub *subscription, delta int32) {
 	if acc == nil || sub == nil {
-		return
-	}
-	acc.mu.RLock()
-	rm := acc.rm
-	acc.mu.RUnlock()
-
-	// This is non-nil when we know we are in cluster mode.
-	if rm == nil {
 		return
 	}
 
@@ -1313,51 +1316,73 @@ func (s *Server) updateRouteSubscriptionMap(acc *Account, sub *subscription, del
 		return
 	}
 
-	// Create the fast key which will use the subject or 'subject<spc>queue' for queue subscribers.
-	var (
-		_rkey  [1024]byte
-		key    []byte
-		update bool
-	)
-	if sub.queue != nil {
-		// Just make the key subject spc group, e.g. 'foo bar'
-		key = _rkey[:0]
-		key = append(key, sub.subject...)
-		key = append(key, byte(' '))
-		key = append(key, sub.queue...)
-		// We always update for a queue subscriber since we need to send our relative weight.
-		update = true
-	} else {
-		key = sub.subject
-	}
-
 	// Copy to hold outside acc lock.
 	var n int32
 	var ok bool
 
-	acc.mu.Lock()
-	if n, ok = rm[string(key)]; ok {
+	isq := len(sub.queue) > 0
+
+	accLock := func() {
+		// Not required for code correctness, but helps reduce the number of
+		// updates sent to the routes when processing high number of concurrent
+		// queue subscriptions updates (sub/unsub).
+		// See https://github.com/nats-io/nats-server/pull/1126 ffor more details.
+		if isq {
+			acc.sqmu.Lock()
+		}
+		acc.mu.Lock()
+	}
+	accUnlock := func() {
+		acc.mu.Unlock()
+		if isq {
+			acc.sqmu.Unlock()
+		}
+	}
+
+	accLock()
+
+	// This is non-nil when we know we are in cluster mode.
+	rm, lqws := acc.rm, acc.lqws
+	if rm == nil {
+		accUnlock()
+		return
+	}
+
+	// Create the fast key which will use the subject or 'subject<spc>queue' for queue subscribers.
+	key := keyFromSub(sub)
+
+	// Decide whether we need to send an update out to all the routes.
+	update := isq
+
+	// This is where we do update to account. For queues we need to take
+	// special care that this order of updates is same as what is sent out
+	// over routes.
+	if n, ok = rm[key]; ok {
 		n += delta
 		if n <= 0 {
-			delete(rm, string(key))
+			delete(rm, key)
+			if isq {
+				delete(lqws, key)
+			}
 			update = true // Update for deleting (N->0)
 		} else {
-			rm[string(key)] = n
+			rm[key] = n
 		}
 	} else if delta > 0 {
 		n = delta
-		rm[string(key)] = delta
+		rm[key] = delta
 		update = true // Adding a new entry for normal sub means update (0->1)
 	}
-	acc.mu.Unlock()
+
+	accUnlock()
 
 	if !update {
 		return
 	}
-	// We need to send out this update.
 
-	// If we are sending a queue sub, copy and place in the queue weight.
-	if sub.queue != nil {
+	// If we are sending a queue sub, make a copy and place in the queue weight.
+	// FIXME(dlc) - We can be smarter here and avoid copying and acquiring the lock.
+	if isq {
 		sub.client.mu.Lock()
 		nsub := *sub
 		sub.client.mu.Unlock()
@@ -1365,45 +1390,52 @@ func (s *Server) updateRouteSubscriptionMap(acc *Account, sub *subscription, del
 		sub = &nsub
 	}
 
-	// Note that queue unsubs where entry.n > 0 are still
-	// subscribes with a smaller weight.
-	if n > 0 {
-		s.broadcastSubscribe(sub)
-	} else {
-		s.broadcastUnSubscribe(sub)
-	}
-}
+	// We need to send out this update. Gather routes
+	var _routes [32]*client
+	routes := _routes[:0]
 
-// broadcastSubscribe will forward a client subscription
-// to all active routes as needed.
-func (s *Server) broadcastSubscribe(sub *subscription) {
-	trace := atomic.LoadInt32(&s.logging.trace) == 1
 	s.mu.Lock()
-	subs := []*subscription{sub}
 	for _, route := range s.routes {
+		routes = append(routes, route)
+	}
+	trace := atomic.LoadInt32(&s.logging.trace) == 1
+	s.mu.Unlock()
+
+	// If we are a queue subscriber we need to make sure our updates are serialized from
+	// potential multiple connections. We want to make sure that the order above is preserved
+	// here but not necessarily all updates need to be sent. We need to block and recheck the
+	// n count with the lock held through sending here. We will suppress duplicate sends of same qw.
+	if isq {
+		// However, we can't hold the acc.mu lock since we allow client.mu.Lock -> acc.mu.Lock
+		// but not the opposite. So use a dedicated lock while holding the route's lock.
+		acc.sqmu.Lock()
+		defer acc.sqmu.Unlock()
+
+		acc.mu.Lock()
+		n = rm[key]
+		sub.qw = n
+		// Check the last sent weight here. If same, then someone
+		// beat us to it and we can just return here. Otherwise update
+		if ls, ok := lqws[key]; ok && ls == n {
+			acc.mu.Unlock()
+			return
+		} else {
+			lqws[key] = n
+		}
+		acc.mu.Unlock()
+	}
+
+	// Snapshot into array
+	subs := []*subscription{sub}
+
+	// Deliver to all routes.
+	for _, route := range routes {
 		route.mu.Lock()
-		route.sendRouteSubProtos(subs, trace, func(sub *subscription) bool {
-			return route.canImport(string(sub.subject))
-		})
+		// Note that queue unsubs where n > 0 are still
+		// subscribes with a smaller weight.
+		route.sendRouteSubOrUnSubProtos(subs, n > 0, trace, route.importFilter)
 		route.mu.Unlock()
 	}
-	s.mu.Unlock()
-}
-
-// broadcastUnSubscribe will forward a client unsubscribe
-// action to all active routes.
-func (s *Server) broadcastUnSubscribe(sub *subscription) {
-	trace := atomic.LoadInt32(&s.logging.trace) == 1
-	s.mu.Lock()
-	subs := []*subscription{sub}
-	for _, route := range s.routes {
-		route.mu.Lock()
-		route.sendRouteUnSubProtos(subs, trace, func(sub *subscription) bool {
-			return route.canImport(string(sub.subject))
-		})
-		route.mu.Unlock()
-	}
-	s.mu.Unlock()
 }
 
 func (s *Server) routeAcceptLoop(ch chan struct{}) {
@@ -1568,7 +1600,7 @@ func (s *Server) reConnectToRoute(rURL *url.URL, rtype RouteType) {
 		s.grWG.Done()
 		return
 	}
-	s.connectToRoute(rURL, tryForEver)
+	s.connectToRoute(rURL, tryForEver, false)
 }
 
 // Checks to make sure the route is still valid.
@@ -1581,11 +1613,13 @@ func (s *Server) routeStillValid(rURL *url.URL) bool {
 	return false
 }
 
-func (s *Server) connectToRoute(rURL *url.URL, tryForEver bool) {
+func (s *Server) connectToRoute(rURL *url.URL, tryForEver, firstConnect bool) {
 	// Snapshot server options.
 	opts := s.getOpts()
 
 	defer s.grWG.Done()
+
+	const connErrFmt = "Error trying to connect to route (attempt %v): %v"
 
 	attempts := 0
 	for s.isRunning() && rURL != nil {
@@ -1595,12 +1629,16 @@ func (s *Server) connectToRoute(rURL *url.URL, tryForEver bool) {
 		s.Debugf("Trying to connect to route on %s", rURL.Host)
 		conn, err := net.DialTimeout("tcp", rURL.Host, DEFAULT_ROUTE_DIAL)
 		if err != nil {
-			s.Errorf("Error trying to connect to route: %v", err)
+			attempts++
+			if s.shouldReportConnectErr(firstConnect, attempts) {
+				s.Errorf(connErrFmt, attempts, err)
+			} else {
+				s.Debugf(connErrFmt, attempts, err)
+			}
 			if !tryForEver {
 				if opts.Cluster.ConnectRetries <= 0 {
 					return
 				}
-				attempts++
 				if attempts > opts.Cluster.ConnectRetries {
 					return
 				}
@@ -1608,7 +1646,7 @@ func (s *Server) connectToRoute(rURL *url.URL, tryForEver bool) {
 			select {
 			case <-s.quitCh:
 				return
-			case <-time.After(DEFAULT_ROUTE_CONNECT):
+			case <-time.After(routeConnectDelay):
 				continue
 			}
 		}
@@ -1634,7 +1672,7 @@ func (c *client) isSolicitedRoute() bool {
 func (s *Server) solicitRoutes(routes []*url.URL) {
 	for _, r := range routes {
 		route := r
-		s.startGoRoutine(func() { s.connectToRoute(route, true) })
+		s.startGoRoutine(func() { s.connectToRoute(route, true, true) })
 	}
 }
 

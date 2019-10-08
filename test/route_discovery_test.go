@@ -1,4 +1,4 @@
-// Copyright 2015-2018 The NATS Authors
+// Copyright 2015-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -26,7 +26,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/gnatsd/server"
+	"github.com/nats-io/nats-server/v2/server"
 )
 
 func runSeedServer(t *testing.T) (*server.Server, *server.Options) {
@@ -634,6 +634,7 @@ func TestImplicitRouteRetry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error during listen: %v", err)
 	}
+	defer rbListen.Close()
 	c, err := rbListen.Accept()
 	if err != nil {
 		t.Fatalf("Error during accept: %v", err)

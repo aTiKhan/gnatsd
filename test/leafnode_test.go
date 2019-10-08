@@ -15,7 +15,9 @@ package test
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net"
 	"net/url"
 	"os"
@@ -26,9 +28,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/gnatsd/server"
-	"github.com/nats-io/go-nats"
 	"github.com/nats-io/jwt"
+	"github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
 )
 
@@ -38,7 +40,6 @@ func createLeafConn(t tLogger, host string, port int) net.Conn {
 
 func testDefaultOptionsForLeafNodes() *server.Options {
 	o := DefaultTestOptions
-	o.Host = "127.0.0.1"
 	o.Port = -1
 	o.LeafNode.Host = o.Host
 	o.LeafNode.Port = -1
@@ -57,11 +58,14 @@ func runLeafServerOnPort(port int) (*server.Server, *server.Options) {
 }
 
 func runSolicitLeafServer(lso *server.Options) (*server.Server, *server.Options) {
+	return runSolicitLeafServerToURL(fmt.Sprintf("nats-leaf://%s:%d", lso.LeafNode.Host, lso.LeafNode.Port))
+}
+
+func runSolicitLeafServerToURL(surl string) (*server.Server, *server.Options) {
 	o := DefaultTestOptions
-	o.Host = "127.0.0.1"
 	o.Port = -1
-	rurl, _ := url.Parse(fmt.Sprintf("nats-leaf://%s:%d", lso.LeafNode.Host, lso.LeafNode.Port))
-	o.LeafNode.Remotes = []*server.RemoteLeafOpts{&server.RemoteLeafOpts{URL: rurl}}
+	rurl, _ := url.Parse(surl)
+	o.LeafNode.Remotes = []*server.RemoteLeafOpts{{URLs: []*url.URL{rurl}}}
 	o.LeafNode.ReconnectInterval = 100 * time.Millisecond
 	return RunServer(&o), &o
 }
@@ -413,9 +417,11 @@ func TestLeafNodeAndRoutes(t *testing.T) {
 	expect(pongRe)
 	expectNothing(t, lc)
 
-	send("UNSUB 2\r\n")
+	send("UNSUB 2\r\nPING\r\n")
+	expect(pongRe)
 	expectNothing(t, lc)
-	send("UNSUB 1\r\n")
+	send("UNSUB 1\r\nPING\r\n")
+	expect(pongRe)
 	leafExpect(lunsubRe)
 
 	// Now put it back and test msg flow.
@@ -516,7 +522,6 @@ type cluster struct {
 
 func testDefaultClusterOptionsForLeafNodes() *server.Options {
 	o := DefaultTestOptions
-	o.Host = "127.0.0.1"
 	o.Port = -1
 	o.Cluster.Host = o.Host
 	o.Cluster.Port = -1
@@ -539,6 +544,9 @@ func shutdownCluster(c *cluster) {
 // Wait for the expected number of outbound gateways, or fails.
 func waitForOutboundGateways(t *testing.T, s *server.Server, expected int, timeout time.Duration) {
 	t.Helper()
+	if timeout < 2*time.Second {
+		timeout = 2 * time.Second
+	}
 	checkFor(t, timeout, 15*time.Millisecond, func() error {
 		if n := s.NumOutboundGateways(); n != expected {
 			return fmt.Errorf("Expected %v outbound gateway(s), got %v", expected, n)
@@ -551,9 +559,53 @@ func waitForOutboundGateways(t *testing.T, s *server.Server, expected int, timeo
 // Will have Gateways and Leaf Node connections active.
 func createClusterWithName(t *testing.T, clusterName string, numServers int, connectTo ...*cluster) *cluster {
 	t.Helper()
+	return createClusterEx(t, false, clusterName, numServers, connectTo...)
+}
+
+// Creates a cluster and optionally additional accounts and users.
+// Will have Gateways and Leaf Node connections active.
+func createClusterEx(t *testing.T, doAccounts bool, clusterName string, numServers int, connectTo ...*cluster) *cluster {
+	t.Helper()
 
 	if clusterName == "" || numServers < 1 {
 		t.Fatalf("Bad params")
+	}
+
+	// Setup some accounts and users.
+	// $SYS is always the system account. And we have default FOO and BAR accounts, as well
+	// as DLC and NGS which do a service import.
+	createAccountsAndUsers := func() ([]*server.Account, []*server.User) {
+		if !doAccounts {
+			return []*server.Account{server.NewAccount("$SYS")}, nil
+		}
+
+		sys := server.NewAccount("$SYS")
+		ngs := server.NewAccount("NGS")
+		dlc := server.NewAccount("DLC")
+		foo := server.NewAccount("FOO")
+		bar := server.NewAccount("BAR")
+
+		accounts := []*server.Account{sys, foo, bar, ngs, dlc}
+
+		ngs.AddServiceExport("ngs.usage.*", nil)
+		dlc.AddServiceImport(ngs, "ngs.usage", "ngs.usage.dlc")
+
+		// Setup users
+		users := []*server.User{
+			&server.User{Username: "dlc", Password: "pass", Permissions: nil, Account: dlc},
+			&server.User{Username: "ngs", Password: "pass", Permissions: nil, Account: ngs},
+			&server.User{Username: "foo", Password: "pass", Permissions: nil, Account: foo},
+			&server.User{Username: "bar", Password: "pass", Permissions: nil, Account: bar},
+			&server.User{Username: "sys", Password: "pass", Permissions: nil, Account: sys},
+		}
+		return accounts, users
+	}
+
+	bindGlobal := func(s *server.Server) {
+		ngs, _ := s.LookupAccount("NGS")
+		// Bind global to service import
+		gacc, _ := s.LookupAccount("$G")
+		gacc.AddServiceImport(ngs, "ngs.usage", "ngs.usage.$G")
 	}
 
 	// If we are going to connect to another cluster set that up now for options.
@@ -565,14 +617,20 @@ func createClusterWithName(t *testing.T, clusterName string, numServers int, con
 		gws = append(gws, &server.RemoteGatewayOpts{Name: c.name, URLs: []*url.URL{gwurl}})
 	}
 
+	// Make the GWs form faster for the tests.
+	server.SetGatewaysSolicitDelay(5 * time.Millisecond)
+	defer server.ResetGatewaysSolicitDelay()
+
 	// Create seed first.
 	o := testDefaultClusterOptionsForLeafNodes()
 	o.Gateway.Name = clusterName
 	o.Gateway.Gateways = gws
 	// All of these need system accounts.
-	o.Accounts = []*server.Account{server.NewAccount("$SYS")}
+	o.Accounts, o.Users = createAccountsAndUsers()
 	o.SystemAccount = "$SYS"
+	// Run the server
 	s := RunServer(o)
+	bindGlobal(s)
 
 	c := &cluster{servers: make([]*server.Server, 0, 3), opts: make([]*server.Options, 0, 3), name: clusterName}
 	c.servers = append(c.servers, s)
@@ -589,9 +647,11 @@ func createClusterWithName(t *testing.T, clusterName string, numServers int, con
 		o.Gateway.Gateways = gws
 		o.Routes = routes
 		// All of these need system accounts.
-		o.Accounts = []*server.Account{server.NewAccount("$SYS")}
+		o.Accounts, o.Users = createAccountsAndUsers()
 		o.SystemAccount = "$SYS"
 		s := RunServer(o)
+		bindGlobal(s)
+
 		c.servers = append(c.servers, s)
 		c.opts = append(c.opts, o)
 	}
@@ -640,6 +700,8 @@ func TestLeafNodeGatewaySendsSystemEvent(t *testing.T) {
 	defer lc.Close()
 
 	leafSend, leafExpect := setupConn(t, lc)
+	// This is for our global responses since we are setting up GWs above.
+	leafExpect(lsubRe)
 	leafSend("PING\r\n")
 	leafExpect(pongRe)
 
@@ -723,6 +785,8 @@ func TestLeafNodeWithRouteAndGateway(t *testing.T) {
 	defer lc.Close()
 
 	leafSend, leafExpect := setupConn(t, lc)
+	// This is for our global responses since we are setting up GWs above.
+	leafExpect(lsubRe)
 	leafSend("PING\r\n")
 	leafExpect(pongRe)
 
@@ -859,8 +923,6 @@ func TestLeafNodeBasicAuth(t *testing.T) {
 	// This one should work.
 	lc = createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
 	defer lc.Close()
-
-	// This should fail since we want u/p
 	leafSend, leafExpect := setupConnWithUserPass(t, lc, "derek", "s3cr3t!")
 	leafSend("PING\r\n")
 	leafExpect(pongRe)
@@ -870,10 +932,9 @@ func TestLeafNodeBasicAuth(t *testing.T) {
 
 func runTLSSolicitLeafServer(lso *server.Options) (*server.Server, *server.Options) {
 	o := DefaultTestOptions
-	o.Host = "127.0.0.1"
 	o.Port = -1
 	rurl, _ := url.Parse(fmt.Sprintf("nats-leaf://%s:%d", lso.LeafNode.Host, lso.LeafNode.Port))
-	remote := &server.RemoteLeafOpts{URL: rurl}
+	remote := &server.RemoteLeafOpts{URLs: []*url.URL{rurl}}
 	remote.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 	host, _, _ := net.SplitHostPort(lso.LeafNode.Host)
 	remote.TLSConfig.ServerName = host
@@ -917,6 +978,75 @@ func TestLeafNodeTLS(t *testing.T) {
 	defer sl.Shutdown()
 
 	checkLeafNodeConnected(t, s)
+}
+
+type captureLeafNodeErrLogger struct {
+	dummyLogger
+	ch chan string
+}
+
+func (c *captureLeafNodeErrLogger) Errorf(format string, v ...interface{}) {
+	msg := fmt.Sprintf(format, v...)
+	select {
+	case c.ch <- msg:
+	default:
+	}
+}
+
+func TestLeafNodeTLSMixIP(t *testing.T) {
+	content := `
+	listen: "127.0.0.1:-1"
+	leafnodes {
+		listen: "127.0.0.1:-1"
+        authorization {
+			user: dlc
+			pass: monkey
+		}
+		tls {
+			cert_file: "./configs/certs/server-noip.pem"
+			key_file:  "./configs/certs/server-key-noip.pem"
+			ca_file:   "./configs/certs/ca.pem"
+		}
+	}
+	`
+	conf := createConfFile(t, []byte(content))
+	defer os.Remove(conf)
+
+	s, opts := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	slContent := `
+	listen: "127.0.0.1:-1"
+	leafnodes {
+		reconnect: 1
+		remotes: [
+			{
+				url: [tls://127.0.0.1:%d, "tls://localhost:%d"]
+				tls { ca_file: "./configs/certs/ca.pem" }
+			}
+		]
+	}
+	`
+	slconf := createConfFile(t, []byte(fmt.Sprintf(slContent, opts.LeafNode.Port, opts.LeafNode.Port)))
+	defer os.Remove(slconf)
+
+	// This will fail but we want to make sure in the correct way, not with
+	// TLS issue because we used an IP for serverName.
+	sl, _ := RunServerWithConfig(slconf)
+	defer s.Shutdown()
+
+	ll := &captureLeafNodeErrLogger{ch: make(chan string, 2)}
+	sl.SetLogger(ll, false, false)
+
+	// We may or may not get an error depending on timing. For the handshake bug
+	// we would always get it, so make sure if we have anything it is not that.
+	select {
+	case msg := <-ll.ch:
+		if strings.Contains(msg, "TLS handshake error") && strings.Contains(msg, "doesn't contain any IP SANs") {
+			t.Fatalf("Got bad error about TLS handshake")
+		}
+	default:
+	}
 }
 
 func runLeafNodeOperatorServer(t *testing.T) (*server.Server, *server.Options, string) {
@@ -1076,6 +1206,79 @@ func TestLeafNodeMultipleAccounts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error during wait for next message: %s", err)
 	}
+}
+
+func TestLeafNodeSignerUser(t *testing.T) {
+	s, opts, conf := runLeafNodeOperatorServer(t)
+	defer os.Remove(conf)
+	defer s.Shutdown()
+
+	// Setup the two accounts for this server.
+	_, akp1 := createAccount(t, s)
+	apk1, _ := akp1.PublicKey()
+
+	// add a signing key to the account
+	akp2, err := nkeys.CreateAccount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	apk2, _ := akp2.PublicKey()
+
+	token, err := s.AccountResolver().Fetch(apk1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ac, err := jwt.DecodeAccountClaims(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ac.SigningKeys.Add(apk2)
+	okp, _ := nkeys.FromSeed(oSeed)
+	token, err = ac.Encode(okp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// update the resolver
+	account, _ := s.LookupAccount(apk1)
+	err = s.AccountResolver().Store(apk1, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.UpdateAccountClaims(account, ac)
+
+	tt, err := s.AccountResolver().Fetch(apk1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ac2, err := jwt.DecodeAccountClaims(tt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ac2.SigningKeys) != 1 && ac2.SigningKeys[0] != apk2 {
+		t.Fatal("signing key is not added")
+	}
+
+	// create an user signed by the signing key
+	kp1, _ := nkeys.CreateUser()
+	pub1, _ := kp1.PublicKey()
+	nuc1 := jwt.NewUserClaims(pub1)
+	nuc1.IssuerAccount = apk1
+	ujwt1, err := nuc1.Encode(akp2)
+	if err != nil {
+		t.Fatalf("Error generating user JWT: %v", err)
+	}
+
+	// Create the leaf node server using the first account.
+	seed, _ := kp1.Seed()
+	mycreds := genCredsFile(t, ujwt1, seed)
+	defer os.Remove(mycreds)
+
+	sl, _, lnconf := runSolicitWithCredentials(t, opts, mycreds)
+	defer os.Remove(lnconf)
+	defer sl.Shutdown()
+
+	checkLeafNodeConnected(t, s)
 }
 
 func TestLeafNodeExportsImports(t *testing.T) {
@@ -1459,6 +1662,59 @@ func TestLeafNodeInfoURLs(t *testing.T) {
 				t.Fatalf("Expected URL to be %s, got %s", s1LNURL, url)
 			}
 			lc.Close()
+
+			s1.Shutdown()
+
+			// Now we need a configuration where both s1 and s2 have a route
+			// to each other, so we need explicit configuration. We are trying
+			// to get S1->S2 and S2->S1 so one of the route is dropped. This
+			// should not affect the number of URLs reported in INFO.
+
+			opts.Cluster.Port = 5223
+			opts.Routes = server.RoutesFromStr(fmt.Sprintf("nats://%s:5224", opts2.Host))
+			s1, _ = server.NewServer(opts)
+			defer s1.Shutdown()
+
+			opts2.Cluster.Port = 5224
+			opts2.Routes = server.RoutesFromStr(fmt.Sprintf("nats://%s:5223", opts.Host))
+			s2, _ = server.NewServer(opts2)
+			defer s2.Shutdown()
+
+			// Start this way to increase chance of having the two connect
+			// to each other at the same time. This will cause one of the
+			// route to be dropped.
+			wg := &sync.WaitGroup{}
+			wg.Add(2)
+			go func() {
+				s1.Start()
+				wg.Done()
+			}()
+			go func() {
+				s2.Start()
+				wg.Done()
+			}()
+
+			checkClusterFormed(t, s1, s2)
+
+			lc = createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
+			defer lc.Close()
+			info = checkInfoMsg(t, lc)
+			if sz := len(info.LeafNodeURLs); sz != 2 {
+				t.Fatalf("Expected LeafNodeURLs array to be size 2, got %v", sz)
+			}
+			ok[0], ok[1] = 0, 0
+			for _, url := range info.LeafNodeURLs {
+				if url == s1LNURL {
+					ok[0]++
+				} else if url == s2LNURL {
+					ok[1]++
+				}
+			}
+			for i, res := range ok {
+				if res != 1 {
+					t.Fatalf("URL from server %v was found %v times", i+1, res)
+				}
+			}
 		})
 	}
 }
@@ -1871,6 +2127,8 @@ func TestLeafNodeSwitchGatewayToInterestModeOnly(t *testing.T) {
 	defer lc.Close()
 
 	leafSend, leafExpect := setupConn(t, lc)
+	// This is for our global responses since we are setting up GWs above.
+	leafExpect(lsubRe)
 	leafSend("PING\r\n")
 	leafExpect(pongRe)
 }
@@ -1903,12 +2161,19 @@ func TestLeafNodeResetsMSGProto(t *testing.T) {
 
 	leafSend, leafExpect := setupConn(t, lc)
 
+	// To avoid possible INFO when switching to interest mode only,
+	// delay start of gateway.
+	time.Sleep(500 * time.Millisecond)
+
 	gw := createGatewayConn(t, opts.Gateway.Host, opts.Gateway.Port)
 	defer gw.Close()
 
 	gwSend, gwExpect := setupGatewayConn(t, gw, "A", "lproto")
 	gwSend("PING\r\n")
 	gwExpect(pongRe)
+
+	// This is for our global responses since we are setting up GWs above.
+	leafExpect(lsubRe)
 
 	// Now setup interest in the leaf node for 'foo'.
 	leafSend("LS+ foo\r\nPING\r\n")
@@ -1971,4 +2236,644 @@ func TestLeafNodeSendsRemoteSubsOnConnect(t *testing.T) {
 
 	_, leafExpect := setupConn(t, lc)
 	leafExpect(lsubRe)
+}
+
+func TestLeafNodeServiceImportLikeNGS(t *testing.T) {
+	server.SetGatewaysSolicitDelay(10 * time.Millisecond)
+	defer server.ResetGatewaysSolicitDelay()
+
+	ca := createClusterEx(t, true, "A", 3)
+	defer shutdownCluster(ca)
+	cb := createClusterEx(t, true, "B", 3, ca)
+	defer shutdownCluster(cb)
+
+	// Hang a responder off of cluster A.
+	opts := ca.opts[0]
+	url := fmt.Sprintf("nats://ngs:pass@%s:%d", opts.Host, opts.Port)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	// Create a queue subscriber to send results
+	nc.QueueSubscribe("ngs.usage.*", "ngs", func(m *nats.Msg) {
+		m.Respond([]byte("22"))
+	})
+	nc.Flush()
+
+	// Now create a leafnode server on B.
+	opts = cb.opts[1]
+	sl, slOpts := runSolicitLeafServer(opts)
+	defer sl.Shutdown()
+
+	// Create a normal direct connect client on B.
+	url = fmt.Sprintf("nats://dlc:pass@%s:%d", opts.Host, opts.Port)
+	nc2, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc2.Close()
+
+	if _, err := nc2.Request("ngs.usage", []byte("fingers crossed"), 500*time.Millisecond); err != nil {
+		t.Fatalf("Did not receive response: %v", err)
+	}
+
+	// Now create a client on the leafnode.
+	url = fmt.Sprintf("nats://%s:%d", slOpts.Host, slOpts.Port)
+	ncl, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer ncl.Close()
+
+	if _, err := ncl.Request("ngs.usage", []byte("fingers crossed"), 500*time.Millisecond); err != nil {
+		t.Fatalf("Did not receive response: %v", err)
+	}
+}
+
+func TestLeafNodeSendsAccountingEvents(t *testing.T) {
+	s, opts, conf := runLeafNodeOperatorServer(t)
+	defer os.Remove(conf)
+	defer s.Shutdown()
+
+	// System account
+	acc, akp := createAccount(t, s)
+	if err := s.SetSystemAccount(acc.Name); err != nil {
+		t.Fatalf("Expected this succeed, got %v", err)
+	}
+
+	// Leafnode Account
+	lacc, lakp := createAccount(t, s)
+
+	// Create a system account user and connect a client to listen for the events.
+	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
+	nc, err := nats.Connect(url, createUserCreds(t, s, akp))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	// Watch only for our leaf node account.
+	cSub, _ := nc.SubscribeSync(fmt.Sprintf("$SYS.ACCOUNT.%s.CONNECT", lacc.Name))
+	dSub, _ := nc.SubscribeSync(fmt.Sprintf("$SYS.ACCOUNT.%s.DISCONNECT", lacc.Name))
+	nc.Flush()
+
+	// Now create creds for the leafnode and connect the server.
+	kp, _ := nkeys.CreateUser()
+	pub, _ := kp.PublicKey()
+	nuc := jwt.NewUserClaims(pub)
+	ujwt, err := nuc.Encode(lakp)
+	if err != nil {
+		t.Fatalf("Error generating user JWT: %v", err)
+	}
+	seed, _ := kp.Seed()
+	mycreds := genCredsFile(t, ujwt, seed)
+	defer os.Remove(mycreds)
+
+	sl, _, lnconf := runSolicitWithCredentials(t, opts, mycreds)
+	defer os.Remove(lnconf)
+	defer sl.Shutdown()
+
+	// Wait for connect event
+	msg, err := cSub.NextMsg(time.Second)
+	if err != nil {
+		t.Fatalf("Error waiting for account connect event: %v", err)
+	}
+	m := server.ConnectEventMsg{}
+	if err := json.Unmarshal(msg.Data, &m); err != nil {
+		t.Fatal("Did not get correctly formatted event")
+	}
+
+	// Shutdown leafnode to generate disconnect event.
+	sl.Shutdown()
+
+	msg, err = dSub.NextMsg(time.Second)
+	if err != nil {
+		t.Fatalf("Error waiting for account disconnect event: %v", err)
+	}
+	dm := server.DisconnectEventMsg{}
+	if err := json.Unmarshal(msg.Data, &dm); err != nil {
+		t.Fatal("Did not get correctly formatted event")
+	}
+}
+
+func TestLeafNodeDistributedQueueAcrossGWs(t *testing.T) {
+	server.SetGatewaysSolicitDelay(10 * time.Millisecond)
+	defer server.ResetGatewaysSolicitDelay()
+
+	ca := createClusterEx(t, true, "A", 3)
+	defer shutdownCluster(ca)
+	cb := createClusterEx(t, true, "B", 3, ca)
+	defer shutdownCluster(cb)
+	cc := createClusterEx(t, true, "C", 3, ca, cb)
+	defer shutdownCluster(cc)
+
+	// Create queue subscribers
+	createQS := func(c *cluster) *nats.Conn {
+		t.Helper()
+		opts := c.opts[rand.Intn(len(c.opts))]
+		url := fmt.Sprintf("nats://ngs:pass@%s:%d", opts.Host, opts.Port)
+		nc, err := nats.Connect(url)
+		if err != nil {
+			t.Fatalf("Error on connect: %v", err)
+		}
+		nc.QueueSubscribe("ngs.usage.*", "dq", func(m *nats.Msg) {
+			m.Respond([]byte(c.name))
+		})
+		nc.Flush()
+		return nc
+	}
+
+	ncA := createQS(ca)
+	defer ncA.Close()
+	ncB := createQS(cb)
+	defer ncB.Close()
+	ncC := createQS(cc)
+	defer ncC.Close()
+
+	connectAndRequest := func(url, clusterName string, nreqs int) {
+		t.Helper()
+		nc, err := nats.Connect(url)
+		if err != nil {
+			t.Fatalf("Error on connect: %v", err)
+		}
+		defer nc.Close()
+		for i := 0; i < nreqs; i++ {
+			m, err := nc.Request("ngs.usage", nil, 500*time.Millisecond)
+			if err != nil {
+				t.Fatalf("Did not receive a response: %v", err)
+			}
+			if string(m.Data) != clusterName {
+				t.Fatalf("Expected to prefer %q, but got response from %q", clusterName, m.Data)
+			}
+		}
+	}
+
+	checkClientDQ := func(c *cluster, nreqs int) {
+		t.Helper()
+		// Pick one at random.
+		opts := c.opts[rand.Intn(len(c.opts))]
+		url := fmt.Sprintf("nats://dlc:pass@%s:%d", opts.Host, opts.Port)
+		connectAndRequest(url, c.name, nreqs)
+	}
+
+	// First check that this works with direct connected clients.
+	checkClientDQ(ca, 100)
+	checkClientDQ(cb, 100)
+	checkClientDQ(cc, 100)
+
+	createLNS := func(c *cluster) (*server.Server, *server.Options) {
+		t.Helper()
+		// Pick one at random.
+		s, opts := runSolicitLeafServer(c.opts[rand.Intn(len(c.servers))])
+		checkLeafNodeConnected(t, s)
+		return s, opts
+	}
+
+	checkLeafDQ := func(opts *server.Options, clusterName string, nreqs int) {
+		t.Helper()
+		url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
+		connectAndRequest(url, clusterName, nreqs)
+	}
+
+	// Test leafnodes to all clusters.
+	for _, c := range []*cluster{ca, cb, cc} {
+		// Now create a leafnode on cluster.
+		sl, slOpts := createLNS(c)
+		defer sl.Shutdown()
+		// Now connect to the leafnode server and run test.
+		checkLeafDQ(slOpts, c.name, 100)
+	}
+}
+
+func TestLeafNodeDistributedQueueEvenly(t *testing.T) {
+	server.SetGatewaysSolicitDelay(10 * time.Millisecond)
+	defer server.ResetGatewaysSolicitDelay()
+
+	ca := createClusterEx(t, true, "A", 3)
+	defer shutdownCluster(ca)
+	cb := createClusterEx(t, true, "B", 3, ca)
+	defer shutdownCluster(cb)
+
+	// Create queue subscribers
+	createQS := func(c *cluster) *nats.Conn {
+		t.Helper()
+		opts := c.opts[rand.Intn(len(c.opts))]
+		url := fmt.Sprintf("nats://ngs:pass@%s:%d", opts.Host, opts.Port)
+		nc, err := nats.Connect(url)
+		if err != nil {
+			t.Fatalf("Error on connect: %v", err)
+		}
+		cid, _ := nc.GetClientID()
+		response := []byte(fmt.Sprintf("%s:%d:%d", c.name, opts.Port, cid))
+		nc.QueueSubscribe("ngs.usage.*", "dq", func(m *nats.Msg) {
+			m.Respond(response)
+		})
+		nc.Flush()
+		return nc
+	}
+
+	ncA1 := createQS(ca)
+	defer ncA1.Close()
+
+	ncA2 := createQS(ca)
+	defer ncA2.Close()
+
+	ncA3 := createQS(ca)
+	defer ncA3.Close()
+
+	resp := make(map[string]int)
+
+	connectAndRequest := func(url, clusterName string, nreqs int) {
+		t.Helper()
+		nc, err := nats.Connect(url)
+		if err != nil {
+			t.Fatalf("Error on connect: %v", err)
+		}
+		defer nc.Close()
+		for i := 0; i < nreqs; i++ {
+			m, err := nc.Request("ngs.usage", nil, 500*time.Millisecond)
+			if err != nil {
+				t.Fatalf("Did not receive a response: %v", err)
+			}
+			if string(m.Data[0]) != clusterName {
+				t.Fatalf("Expected to prefer %q, but got response from %q", clusterName, m.Data[0])
+			}
+			resp[string(m.Data)]++
+		}
+	}
+
+	createLNS := func(c *cluster) (*server.Server, *server.Options) {
+		t.Helper()
+		// Pick one at random.
+		copts := c.opts[rand.Intn(len(c.servers))]
+		s, opts := runSolicitLeafServer(copts)
+		checkLeafNodeConnected(t, s)
+		return s, opts
+	}
+
+	checkLeafDQ := func(opts *server.Options, clusterName string, nreqs int) {
+		t.Helper()
+		url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
+		connectAndRequest(url, clusterName, nreqs)
+	}
+
+	// Now create a leafnode on cluster A.
+	sl, slOpts := createLNS(ca)
+	defer sl.Shutdown()
+
+	// Now connect to the leafnode server and run test.
+	checkLeafDQ(slOpts, ca.name, 100)
+
+	// Should have some for all 3 QS [ncA1, ncA2, ncA3]
+	if lr := len(resp); lr != 3 {
+		t.Fatalf("Expected all 3 queue subscribers to have received some messages, only got %d", lr)
+	}
+	// Now check that we have at least 10% for each subscriber.
+	for _, r := range resp {
+		if r < 10 {
+			t.Fatalf("Got a subscriber with less than 10 responses: %d", r)
+		}
+	}
+}
+
+func TestLeafNodeDefaultPort(t *testing.T) {
+	o := testDefaultOptionsForLeafNodes()
+	o.LeafNode.Port = server.DEFAULT_LEAFNODE_PORT
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	conf := createConfFile(t, []byte(`
+		port: -1
+		leaf {
+			remotes = [
+				{
+					url: "leafnode://127.0.0.1"
+				}
+			]
+		}
+	`))
+	defer os.Remove(conf)
+
+	sl, _ := RunServerWithConfig(conf)
+	defer sl.Shutdown()
+
+	checkLeafNodeConnected(t, s)
+}
+
+// Since leafnode's are true interest only we need to make sure that we
+// register the proper interest with global routing $GR.xxxxxx._INBOX.>
+func TestLeafNodeAndGatewayGlobalRouting(t *testing.T) {
+	server.SetGatewaysSolicitDelay(50 * time.Millisecond)
+	defer server.ResetGatewaysSolicitDelay()
+
+	ca := createClusterWithName(t, "A", 3)
+	defer shutdownCluster(ca)
+	cb := createClusterWithName(t, "B", 3, ca)
+	defer shutdownCluster(cb)
+
+	sl, slOpts := runSolicitLeafServer(ca.opts[1])
+	defer sl.Shutdown()
+
+	checkLeafNodeConnected(t, ca.servers[1])
+
+	// Create a client on the leafnode. This will listen for requests.
+	ncl, err := nats.Connect(fmt.Sprintf("nats://%s:%d", slOpts.Host, slOpts.Port))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer ncl.Close()
+
+	ncl.Subscribe("foo", func(m *nats.Msg) {
+		m.Respond([]byte("World"))
+	})
+	ncl.Flush()
+
+	// Create a direct connect requestor.
+	opts := cb.opts[1]
+	url := fmt.Sprintf("nats://ngs:pass@%s:%d", opts.Host, opts.Port)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	if _, err := nc.Request("foo", []byte("Hello"), 250*time.Millisecond); err != nil {
+		t.Fatalf("Failed to get response: %v", err)
+	}
+}
+
+func checkLeafNode2Connected(t *testing.T, s *server.Server) {
+	t.Helper()
+	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+		if nln := s.NumLeafNodes(); nln != 2 {
+			return fmt.Errorf("Expected a connected leafnode for server %q, got none", s.ID())
+		}
+		return nil
+	})
+}
+
+func TestLeafNodesStaggeredSubPub(t *testing.T) {
+	s, opts := runLeafServer()
+	defer s.Shutdown()
+
+	sl1, sl1Opts := runSolicitLeafServer(opts)
+	defer sl1.Shutdown()
+
+	checkLeafNodeConnected(t, s)
+
+	// Create a client on the leafnode and a subscription.
+	ncl, err := nats.Connect(fmt.Sprintf("nats://%s:%d", sl1Opts.Host, sl1Opts.Port))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer ncl.Close()
+
+	sub, err := ncl.SubscribeSync("foo")
+	if err != nil {
+		t.Fatalf("Failed to subscribe: %v", err)
+	}
+
+	sl2, sl2Opts := runSolicitLeafServer(opts)
+	defer sl2.Shutdown()
+
+	checkLeafNode2Connected(t, s)
+
+	// Create a client on the second leafnode and publish a message.
+	ncl2, err := nats.Connect(fmt.Sprintf("nats://%s:%d", sl2Opts.Host, sl2Opts.Port))
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer ncl2.Close()
+
+	ncl2.Publish("foo", nil)
+
+	checkFor(t, 250*time.Millisecond, 10*time.Millisecond, func() error {
+		if nmsgs, _, err := sub.Pending(); err != nil || nmsgs != 1 {
+			return fmt.Errorf("Did not receive the message: %v", err)
+		}
+		return nil
+	})
+}
+
+func TestLeafNodeMultipleRemoteURLs(t *testing.T) {
+	s, opts := runLeafServer()
+	defer s.Shutdown()
+
+	content := `
+		port: -1
+		leafnodes {
+			remotes = [
+				{
+					urls: [nats-leaf://127.0.0.1:%d,nats-leaf://localhost:%d]
+				}
+			]
+		}
+		`
+
+	config := fmt.Sprintf(content, opts.LeafNode.Port, opts.LeafNode.Port)
+	conf := createConfFile(t, []byte(config))
+	sl, _ := RunServerWithConfig(conf)
+	defer os.Remove(conf)
+	defer sl.Shutdown()
+
+	checkLeafNodeConnected(t, s)
+}
+
+func runSolicitLeafCluster(t *testing.T, clusterName string, d1, d2 *cluster) *cluster {
+	c := &cluster{servers: make([]*server.Server, 0, 2), opts: make([]*server.Options, 0, 2), name: clusterName}
+
+	// Who we will solicit for server 1
+	ci := rand.Intn(len(d1.opts))
+	opts := d1.opts[ci]
+	surl := fmt.Sprintf("nats-leaf://%s:%d", opts.LeafNode.Host, opts.LeafNode.Port)
+
+	o := DefaultTestOptions
+	o.Port = -1
+	rurl, _ := url.Parse(surl)
+	o.LeafNode.Remotes = []*server.RemoteLeafOpts{{URLs: []*url.URL{rurl}}}
+	o.LeafNode.ReconnectInterval = 100 * time.Millisecond
+	o.Cluster.Host = o.Host
+	o.Cluster.Port = -1
+	s := RunServer(&o)
+	checkLeafNodeConnected(t, d1.servers[ci])
+
+	c.servers = append(c.servers, s)
+	c.opts = append(c.opts, &o)
+
+	// Grab route info
+	routeAddr := fmt.Sprintf("nats-route://%s:%d", o.Cluster.Host, o.Cluster.Port)
+	curl, _ := url.Parse(routeAddr)
+
+	// Who we will solicit for server 2
+	ci = rand.Intn(len(d2.opts))
+	opts = d2.opts[ci]
+	surl = fmt.Sprintf("nats-leaf://%s:%d", opts.LeafNode.Host, opts.LeafNode.Port)
+
+	// This is for the case were d1 == d2 and we select the same server.
+	plfn := d2.servers[ci].NumLeafNodes()
+
+	o2 := DefaultTestOptions
+	o2.Port = -1
+	rurl, _ = url.Parse(surl)
+	o2.LeafNode.Remotes = []*server.RemoteLeafOpts{{URLs: []*url.URL{rurl}}}
+	o2.LeafNode.ReconnectInterval = 100 * time.Millisecond
+	o2.Cluster.Host = o.Host
+	o2.Cluster.Port = -1
+	o2.Routes = []*url.URL{curl}
+	s = RunServer(&o2)
+
+	if plfn == 0 {
+		checkLeafNodeConnected(t, d2.servers[ci])
+	} else {
+		checkLeafNode2Connected(t, d2.servers[ci])
+	}
+
+	c.servers = append(c.servers, s)
+	c.opts = append(c.opts, &o2)
+
+	checkClusterFormed(t, c.servers...)
+
+	return c
+}
+
+func clientForCluster(t *testing.T, c *cluster) *nats.Conn {
+	t.Helper()
+	opts := c.opts[rand.Intn(len(c.opts))]
+	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	return nc
+}
+
+func TestLeafNodeCycleWithSolicited(t *testing.T) {
+	server.SetGatewaysSolicitDelay(10 * time.Millisecond)
+	defer server.ResetGatewaysSolicitDelay()
+
+	// Accepting leafnode cluster, e.g. NGS
+	ca := createClusterWithName(t, "A", 3)
+	defer shutdownCluster(ca)
+	cb := createClusterWithName(t, "B", 3, ca)
+	defer shutdownCluster(cb)
+
+	// Create the responders.
+	requestsReceived := int32(0)
+
+	nc := clientForCluster(t, ca)
+	defer nc.Close()
+	nc.QueueSubscribe("request", "cycles", func(m *nats.Msg) {
+		atomic.AddInt32(&requestsReceived, 1)
+		m.Respond([]byte("22"))
+	})
+	nc.Flush()
+
+	nc = clientForCluster(t, cb)
+	defer nc.Close()
+	nc.QueueSubscribe("request", "cycles", func(m *nats.Msg) {
+		atomic.AddInt32(&requestsReceived, 1)
+		m.Respond([]byte("33"))
+	})
+	nc.Flush()
+
+	// Soliciting cluster, both solicited connected to the "A" cluster
+	sc := runSolicitLeafCluster(t, "SC", ca, ca)
+	defer shutdownCluster(sc)
+
+	// Connect a client to a random server in sc
+	createClientAndRequest := func(c *cluster) (*nats.Conn, *nats.Subscription) {
+		nc := clientForCluster(t, c)
+		reply := nats.NewInbox()
+		sub, err := nc.SubscribeSync(reply)
+		if err != nil {
+			t.Fatalf("Could not subscribe: %v", err)
+		}
+		if err := nc.PublishRequest("request", reply, []byte("fingers crossed")); err != nil {
+			t.Fatalf("Error sending request: %v", err)
+		}
+		return nc, sub
+	}
+
+	verifyOneResponse := func(sub *nats.Subscription) {
+		time.Sleep(250 * time.Millisecond)
+		m, _, err := sub.Pending()
+		if err != nil {
+			t.Fatalf("Error calling Pending(): %v", err)
+		}
+		if m > 1 {
+			t.Fatalf("Received more then one response, cycle indicated: %d", m)
+		}
+	}
+
+	verifyRequestTotal := func(nre int32) {
+		if nr := atomic.LoadInt32(&requestsReceived); nr != nre {
+			t.Fatalf("Expected %d requests received, got %d", nre, nr)
+		}
+	}
+
+	// This should pass to here, but if we have a cycle things will be spinning and we will receive
+	// too many responses when it should only be 1.
+	nc, rsub := createClientAndRequest(sc)
+	defer nc.Close()
+	verifyOneResponse(rsub)
+	verifyRequestTotal(1)
+
+	// Do a solicit across GW, so shut this one down.
+	nc.Close()
+	shutdownCluster(sc)
+
+	// Soliciting cluster, connect to different clusters across a GW.
+	sc = runSolicitLeafCluster(t, "SC", ca, cb)
+	defer shutdownCluster(sc)
+
+	nc, rsub = createClientAndRequest(sc)
+	defer nc.Close()
+	verifyOneResponse(rsub)
+	verifyRequestTotal(2) // This is total since use same responders.
+}
+
+func TestLeafNodeNoRaceGeneratingNonce(t *testing.T) {
+	opts := testDefaultOptionsForLeafNodes()
+	opts.Cluster.Port = -1
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	quitCh := make(chan struct{})
+	wg := sync.WaitGroup{}
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		for {
+			lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
+			checkInfoMsg(t, lc)
+			lc.Close()
+			select {
+			case <-quitCh:
+				return
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		for {
+			rc := createRouteConn(t, opts.Cluster.Host, opts.Cluster.Port)
+			checkInfoMsg(t, rc)
+			rc.Close()
+			select {
+			case <-quitCh:
+				return
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}()
+
+	// Let this run for a bit to see if we get data race
+	time.Sleep(100 * time.Millisecond)
+	close(quitCh)
+	wg.Wait()
 }

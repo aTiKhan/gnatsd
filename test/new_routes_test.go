@@ -1,4 +1,4 @@
-// Copyright 2018 The NATS Authors
+// Copyright 2018-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,17 +14,18 @@
 package test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
-	"net/url"
-	"runtime"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/nats-io/gnatsd/logger"
-	"github.com/nats-io/gnatsd/server"
-	"github.com/nats-io/go-nats"
+	"github.com/nats-io/nats-server/v2/logger"
+	"github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nuid"
 )
 
 func runNewRouteServer(t *testing.T) (*server.Server, *server.Options) {
@@ -239,7 +240,8 @@ func TestNewRouteRSubs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Could not marshal test route info: %v", err)
 	}
-	routeSend(fmt.Sprintf("INFO %s\r\nPING\r\n", b))
+	routeSend(fmt.Sprintf("INFO %s\r\n", b))
+	routeSend("PING\r\n")
 	routeExpect(pongRe)
 
 	// Have the client listen on foo.
@@ -414,7 +416,6 @@ func TestNewRouteClientClosedWithNormalSubscriptions(t *testing.T) {
 		t.Fatalf("Could not marshal test route info: %v", err)
 	}
 	routeSend(fmt.Sprintf("INFO %s\r\n", b))
-
 	routeSend("PING\r\n")
 	routeExpect(pongRe)
 
@@ -464,7 +465,6 @@ func TestNewRouteClientClosedWithQueueSubscriptions(t *testing.T) {
 		t.Fatalf("Could not marshal test route info: %v", err)
 	}
 	routeSend(fmt.Sprintf("INFO %s\r\n", b))
-
 	routeSend("PING\r\n")
 	routeExpect(pongRe)
 
@@ -605,7 +605,8 @@ func TestNewRouteSendSubsAndMsgs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Could not marshal test route info: %v", err)
 	}
-	routeSend(fmt.Sprintf("INFO %s\r\nPING\r\n", b))
+	routeSend(fmt.Sprintf("INFO %s\r\n", b))
+	routeSend("PING\r\n")
 	routeExpect(pongRe)
 
 	// Now let's send in interest from the new protocol.
@@ -732,7 +733,8 @@ func TestNewRouteProcessRoutedMsgs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Could not marshal test route info: %v", err)
 	}
-	routeSend(fmt.Sprintf("INFO %s\r\nPING\r\n", b))
+	routeSend(fmt.Sprintf("INFO %s\r\n", b))
+	routeSend("PING\r\n")
 	routeExpect(pongRe)
 
 	// Create a client
@@ -1601,53 +1603,123 @@ func TestNewRouteLargeDistinctQueueSubscribers(t *testing.T) {
 	})
 }
 
-func TestLargeClusterMem(t *testing.T) {
-	// Try to clean up.
-	runtime.GC()
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	pta := m.TotalAlloc
+func TestClusterLeaksSubscriptions(t *testing.T) {
+	srvA, srvB, optsA, optsB := runServers(t)
+	defer srvA.Shutdown()
+	defer srvB.Shutdown()
 
-	opts := func() *server.Options {
-		o := DefaultTestOptions
-		o.Host = "127.0.0.1"
-		o.Port = -1
-		o.Cluster.Host = o.Host
-		o.Cluster.Port = -1
-		return &o
+	checkClusterFormed(t, srvA, srvB)
+
+	urlA := fmt.Sprintf("nats://%s:%d/", optsA.Host, optsA.Port)
+	urlB := fmt.Sprintf("nats://%s:%d/", optsB.Host, optsB.Port)
+
+	numResponses := 100
+	repliers := make([]*nats.Conn, 0, numResponses)
+
+	// Create 100 repliers
+	for i := 0; i < 50; i++ {
+		nc1, _ := nats.Connect(urlA)
+		nc2, _ := nats.Connect(urlB)
+		repliers = append(repliers, nc1, nc2)
+		nc1.Subscribe("test.reply", func(m *nats.Msg) {
+			m.Respond([]byte("{\"sender\": 22 }"))
+		})
+		nc2.Subscribe("test.reply", func(m *nats.Msg) {
+			m.Respond([]byte("{\"sender\": 33 }"))
+		})
+		nc1.Flush()
+		nc2.Flush()
 	}
 
-	var servers []*server.Server
+	servers := fmt.Sprintf("%s, %s", urlA, urlB)
+	req := sizedBytes(8 * 1024)
 
-	// Create seed first.
-	o := opts()
-	s := RunServer(o)
-	servers = append(servers, s)
+	// Now run a requestor in a loop, creating and tearing down each time to
+	// simulate running a modified nats-req.
+	doReq := func() {
+		msgs := make(chan *nats.Msg, 1)
+		inbox := nats.NewInbox()
+		grp := nuid.Next()
+		// Create 8 queue Subscribers for responses.
+		for i := 0; i < 8; i++ {
+			nc, _ := nats.Connect(servers)
+			nc.ChanQueueSubscribe(inbox, grp, msgs)
+			nc.Flush()
+			defer nc.Close()
+		}
+		nc, _ := nats.Connect(servers)
+		nc.PublishRequest("test.reply", inbox, req)
+		defer nc.Close()
 
-	// For connecting to seed server above.
-	routeAddr := fmt.Sprintf("nats-route://%s:%d", o.Cluster.Host, o.Cluster.Port)
-	rurl, _ := url.Parse(routeAddr)
-	routes := []*url.URL{rurl}
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
 
-	numServers := 15
-
-	for i := 1; i < numServers; i++ {
-		o := opts()
-		o.Routes = routes
-		s := RunServer(o)
-		servers = append(servers, s)
+		var received int
+		for {
+			select {
+			case <-msgs:
+				received++
+				if received >= numResponses {
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
 	}
-	checkClusterFormed(t, servers...)
 
-	// Calculate in MB what we are using now.
-	const max = 50 * 1024 * 1024 // 50MB
-	runtime.ReadMemStats(&m)
-	used := m.TotalAlloc - pta
-	if used > max {
-		t.Fatalf("Cluster using too much memory, expect < 50MB, got %dMB", used/(1024*1024))
+	var wg sync.WaitGroup
+
+	doRequests := func(n int) {
+		for i := 0; i < n; i++ {
+			doReq()
+		}
+		wg.Done()
 	}
 
-	for _, s := range servers {
-		s.Shutdown()
+	concurrent := 10
+	wg.Add(concurrent)
+	for i := 0; i < concurrent; i++ {
+		go doRequests(10)
 	}
+	wg.Wait()
+
+	// Close responders too, should have zero(0) subs attached to routes.
+	for _, nc := range repliers {
+		nc.Close()
+	}
+
+	// Make sure no clients remain. This is to make sure the test is correct and that
+	// we have closed all the client connections.
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		v1, _ := srvA.Varz(nil)
+		v2, _ := srvB.Varz(nil)
+		if v1.Connections != 0 || v2.Connections != 0 {
+			return fmt.Errorf("We have lingering client connections %d:%d", v1.Connections, v2.Connections)
+		}
+		return nil
+	})
+
+	loadRoutez := func() (*server.Routez, *server.Routez) {
+		v1, err := srvA.Routez(&server.RoutezOptions{Subscriptions: true})
+		if err != nil {
+			t.Fatalf("Error getting Routez: %v", err)
+		}
+		v2, err := srvB.Routez(&server.RoutezOptions{Subscriptions: true})
+		if err != nil {
+			t.Fatalf("Error getting Routez: %v", err)
+		}
+		return v1, v2
+	}
+
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		r1, r2 := loadRoutez()
+		if r1.Routes[0].NumSubs != 0 {
+			return fmt.Errorf("Leaked %d subs: %+v", r1.Routes[0].NumSubs, r1.Routes[0].Subs)
+		}
+		if r2.Routes[0].NumSubs != 0 {
+			return fmt.Errorf("Leaked %d subs: %+v", r2.Routes[0].NumSubs, r2.Routes[0].Subs)
+		}
+		return nil
+	})
 }

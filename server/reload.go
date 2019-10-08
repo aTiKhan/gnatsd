@@ -249,14 +249,6 @@ func (u *nkeysOption) Apply(server *Server) {
 	server.Noticef("Reloaded: authorization nkey users")
 }
 
-type trustKeysOption struct {
-	noopOption
-}
-
-func (u *trustKeysOption) Apply(server *Server) {
-	server.Noticef("Reloaded: trusted keys")
-}
-
 // clusterOption implements the option interface for the `cluster` setting.
 type clusterOption struct {
 	authOption
@@ -305,6 +297,11 @@ func (r *routesOption) Apply(server *Server) {
 	for _, client := range server.routes {
 		routes[i] = client
 		i++
+	}
+	// If there was a change, notify monitoring code that it should
+	// update the route URLs if /varz endpoint is inspected.
+	if len(r.add)+len(r.remove) > 0 {
+		server.varzUpdateRouteURLs = true
 	}
 	server.mu.Unlock()
 
@@ -502,6 +499,44 @@ func (a *accountsOption) Apply(s *Server) {
 	s.Noticef("Reloaded: accounts")
 }
 
+// connectErrorReports implements the option interface for the `connect_error_reports`
+// setting.
+type connectErrorReports struct {
+	noopOption
+	newValue int
+}
+
+// Apply is a no-op because the value will be reloaded after options are applied.
+func (c *connectErrorReports) Apply(s *Server) {
+	s.Noticef("Reloaded: connect_error_reports = %v", c.newValue)
+}
+
+// connectErrorReports implements the option interface for the `connect_error_reports`
+// setting.
+type reconnectErrorReports struct {
+	noopOption
+	newValue int
+}
+
+// Apply is a no-op because the value will be reloaded after options are applied.
+func (r *reconnectErrorReports) Apply(s *Server) {
+	s.Noticef("Reloaded: reconnect_error_reports = %v", r.newValue)
+}
+
+// maxTracedMsgLenOption implements the option interface for the `max_traced_msg_len` setting.
+type maxTracedMsgLenOption struct {
+	noopOption
+	newValue int
+}
+
+// Apply the setting by updating the maximum traced message length.
+func (m *maxTracedMsgLenOption) Apply(server *Server) {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	server.opts.MaxTracedMsgLen = m.newValue
+	server.Noticef("Reloaded: max_traced_msg_len = %d", m.newValue)
+}
+
 // Reload reads the current configuration file and applies any supported
 // changes. This returns an error if the server was not started with a config
 // file or an option which doesn't support hot-swapping was changed.
@@ -511,6 +546,7 @@ func (s *Server) Reload() error {
 		s.mu.Unlock()
 		return errors.New("can only reload config when a file is provided using -c or --config")
 	}
+
 	newOpts, err := ProcessConfigFile(s.configFile)
 	if err != nil {
 		s.mu.Unlock()
@@ -564,6 +600,7 @@ func (s *Server) Reload() error {
 	}
 	s.mu.Lock()
 	s.configTime = time.Now()
+	s.updateVarzConfigReloadableFields(s.varz)
 	s.mu.Unlock()
 	return nil
 }
@@ -705,8 +742,13 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			diffOpts = append(diffOpts, &clientAdvertiseOption{newValue: cliAdv})
 		case "accounts":
 			diffOpts = append(diffOpts, &accountsOption{})
-		case "trustedkeys":
-			diffOpts = append(diffOpts, &trustKeysOption{})
+		case "accountresolver":
+			// We can't move from no resolver to one. So check for that.
+			if (oldValue == nil && newValue != nil) ||
+				(oldValue != nil && newValue == nil) {
+				return nil, fmt.Errorf("config reload does not support moving to or from an account resolver")
+			}
+			diffOpts = append(diffOpts, &accountsOption{})
 		case "gateway":
 			// Not supported for now, but report warning if configuration of gateway
 			// is actually changed so that user knows that it won't take effect.
@@ -735,10 +777,16 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 				return nil, fmt.Errorf("config reload not supported for %s: old=%v, new=%v",
 					field.Name, oldValue, newValue)
 			}
+		case "connecterrorreports":
+			diffOpts = append(diffOpts, &connectErrorReports{newValue: newValue.(int)})
+		case "reconnecterrorreports":
+			diffOpts = append(diffOpts, &reconnectErrorReports{newValue: newValue.(int)})
 		case "nolog", "nosigs":
 			// Ignore NoLog and NoSigs options since they are not parsed and only used in
 			// testing.
 			continue
+		case "maxtracedmsglen":
+			diffOpts = append(diffOpts, &maxTracedMsgLenOption{newValue: newValue.(int)})
 		case "port":
 			// check to see if newValue == 0 and continue if so.
 			if newValue == 0 {
@@ -797,53 +845,92 @@ func (s *Server) applyOptions(ctx *reloadContext, opts []option) {
 // disconnects any clients who are no longer authorized, and removes any
 // unauthorized subscriptions.
 func (s *Server) reloadAuthorization() {
-	s.mu.Lock()
-
-	// We need to drain the old accounts here since we have something
-	// new configured. We do not want s.accounts to change since that would
-	// mean adding a lock to lookupAccount which is what we are trying to
-	// optimize for with the change from a map to a sync.Map.
-	oldAccounts := make(map[string]*Account)
-	s.accounts.Range(func(k, v interface{}) bool {
-		acc := v.(*Account)
-		acc.mu.RLock()
-		oldAccounts[acc.Name] = acc
-		acc.mu.RUnlock()
-		s.accounts.Delete(k)
-		return true
-	})
-	s.gacc = nil
-	s.configureAccounts()
-
-	s.configureAuthorization()
-
 	// This map will contain the names of accounts that have their streams
 	// import configuration changed.
 	awcsti := make(map[string]struct{})
 
-	s.accounts.Range(func(k, v interface{}) bool {
-		newAcc := v.(*Account)
-		if acc, ok := oldAccounts[newAcc.Name]; ok {
-			// If account exist in latest config, "transfer" the account's
-			// sublist and client map to the new account.
+	s.mu.Lock()
+
+	// This can not be changed for now so ok to check server's trustedKeys
+	if s.trustedKeys == nil {
+		// We need to drain the old accounts here since we have something
+		// new configured. We do not want s.accounts to change since that would
+		// mean adding a lock to lookupAccount which is what we are trying to
+		// optimize for with the change from a map to a sync.Map.
+		oldAccounts := make(map[string]*Account)
+		s.accounts.Range(func(k, v interface{}) bool {
+			acc := v.(*Account)
 			acc.mu.RLock()
-			if len(acc.clients) > 0 {
-				newAcc.clients = make(map[*client]*client, len(acc.clients))
-				for _, c := range acc.clients {
-					newAcc.clients[c] = c
+			oldAccounts[acc.Name] = acc
+			acc.mu.RUnlock()
+			s.accounts.Delete(k)
+			return true
+		})
+		s.gacc = nil
+		s.configureAccounts()
+		s.configureAuthorization()
+
+		s.accounts.Range(func(k, v interface{}) bool {
+			newAcc := v.(*Account)
+			if acc, ok := oldAccounts[newAcc.Name]; ok {
+				// If account exist in latest config, "transfer" the account's
+				// sublist and client map to the new account.
+				acc.mu.RLock()
+				if len(acc.clients) > 0 {
+					newAcc.clients = make(map[*client]*client, len(acc.clients))
+					for _, c := range acc.clients {
+						newAcc.clients[c] = c
+					}
+				}
+				newAcc.sl = acc.sl
+				newAcc.rm = acc.rm
+				newAcc.respMap = acc.respMap
+				acc.mu.RUnlock()
+
+				// Check if current and new config of this account are same
+				// in term of stream imports.
+				if !acc.checkStreamImportsEqual(newAcc) {
+					awcsti[newAcc.Name] = struct{}{}
 				}
 			}
-			newAcc.sl = acc.sl
-			acc.mu.RUnlock()
-
-			// Check if current and new config of this account are same
-			// in term of stream imports.
-			if !acc.checkStreamImportsEqual(newAcc) {
-				awcsti[newAcc.Name] = struct{}{}
-			}
+			return true
+		})
+	} else if s.opts.AccountResolver != nil {
+		s.configureResolver()
+		if _, ok := s.accResolver.(*MemAccResolver); ok {
+			// Check preloads so we can issue warnings etc if needed.
+			s.checkResolvePreloads()
+			// With a memory resolver we want to do something similar to configured accounts.
+			// We will walk the accounts and delete them if they are no longer present via fetch.
+			// If they are present we will force a claim update to process changes.
+			s.accounts.Range(func(k, v interface{}) bool {
+				acc := v.(*Account)
+				// Skip global account.
+				if acc == s.gacc {
+					return true
+				}
+				acc.mu.RLock()
+				accName := acc.Name
+				acc.mu.RUnlock()
+				// Release server lock for following actions
+				s.mu.Unlock()
+				accClaims, claimJWT, _ := s.fetchAccountClaims(accName)
+				if accClaims != nil {
+					err := s.updateAccountWithClaimJWT(acc, claimJWT)
+					if err != nil && err != ErrAccountResolverSameClaims {
+						s.Noticef("Reloaded: deleting account [bad claims]: %q", accName)
+						s.accounts.Delete(k)
+					}
+				} else {
+					s.Noticef("Reloaded: deleting account [removed]: %q", accName)
+					s.accounts.Delete(k)
+				}
+				// Regrab server lock.
+				s.mu.Lock()
+				return true
+			})
 		}
-		return true
-	})
+	}
 
 	// Gather clients that changed accounts. We will close them and they
 	// will reconnect, doing the right thing.
@@ -884,7 +971,7 @@ func (s *Server) reloadAuthorization() {
 
 	for _, route := range routes {
 		// Disconnect any unauthorized routes.
-		// Do this only for route that were accepted, not initiated
+		// Do this only for routes that were accepted, not initiated
 		// because in the later case, we don't have the user name/password
 		// of the remote server.
 		if !route.isSolicitedRoute() && !s.isRouterAuthorized(route) {

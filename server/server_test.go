@@ -1,4 +1,4 @@
-// Copyright 2012-2018 The NATS Authors
+// Copyright 2012-2019 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,9 +14,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"net"
 	"net/url"
 	"os"
@@ -26,7 +28,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/go-nats"
+	"github.com/nats-io/nats.go"
 )
 
 func checkFor(t *testing.T, totalWait, sleepDur time.Duration, f func() error) {
@@ -419,7 +421,7 @@ func TestMaxSubscriptions(t *testing.T) {
 func TestProcessCommandLineArgs(t *testing.T) {
 	var host string
 	var port int
-	cmd := flag.NewFlagSet("gnatsd", flag.ExitOnError)
+	cmd := flag.NewFlagSet("nats-server", flag.ExitOnError)
 	cmd.StringVar(&host, "a", "0.0.0.0", "Host.")
 	cmd.IntVar(&port, "p", 4222, "Port.")
 
@@ -1086,16 +1088,31 @@ func TestClientWriteLoopStall(t *testing.T) {
 	}
 }
 
-func TestInsecureSkipVerifyNotSupportedForClientAndGateways(t *testing.T) {
-	checkServerFails := func(t *testing.T, o *Options) {
+func TestInsecureSkipVerifyWarning(t *testing.T) {
+	checkWarnReported := func(t *testing.T, o *Options, expectedWarn string) {
 		t.Helper()
 		s, err := NewServer(o)
-		if s != nil {
-			s.Shutdown()
+		if err != nil {
+			t.Fatalf("Error on new server: %v", err)
 		}
-		if err == nil || !strings.Contains(err.Error(), "not supported") {
-			t.Fatalf("Expected error about not supported feature, got %v", err)
+		l := &captureWarnLogger{warn: make(chan string, 1)}
+		s.SetLogger(l, false, false)
+		wg := sync.WaitGroup{}
+		wg.Add(1)
+		go func() {
+			s.Start()
+			wg.Done()
+		}()
+		select {
+		case w := <-l.warn:
+			if !strings.Contains(w, expectedWarn) {
+				t.Fatalf("Expected warning %q, got %q", expectedWarn, w)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("Did not get warning %q", expectedWarn)
 		}
+		s.Shutdown()
+		wg.Wait()
 	}
 
 	tc := &TLSConfigOpts{}
@@ -1103,39 +1120,427 @@ func TestInsecureSkipVerifyNotSupportedForClientAndGateways(t *testing.T) {
 	tc.KeyFile = "../test/configs/certs/server-key.pem"
 	tc.CaFile = "../test/configs/certs/ca.pem"
 	tc.Insecure = true
-
-	o := DefaultOptions()
 	config, err := GenTLSConfig(tc)
 	if err != nil {
 		t.Fatalf("Error generating tls config: %v", err)
 	}
-	o.TLSConfig = config
-	checkServerFails(t, o)
 
-	// Get a clone that we will use for the Gateway TLS setting
-	gwConfig := config.Clone()
+	o := DefaultOptions()
+	o.Cluster.Port = -1
+	o.Cluster.TLSConfig = config.Clone()
+	checkWarnReported(t, o, clusterTLSInsecureWarning)
 
-	// Remove the setting
-	o.TLSConfig.InsecureSkipVerify = false
-	// Configure GW
+	// Remove the route setting
+	o.Cluster.Port = 0
+	o.Cluster.TLSConfig = nil
+
+	// Configure LeafNode with no TLS in the main block first, but only with remotes.
+	o.LeafNode.Port = -1
+	rurl, _ := url.Parse("nats://127.0.0.1:1234")
+	o.LeafNode.Remotes = []*RemoteLeafOpts{
+		{
+			URLs:      []*url.URL{rurl},
+			TLSConfig: config.Clone(),
+		},
+	}
+	checkWarnReported(t, o, leafnodeTLSInsecureWarning)
+
+	// Now add to main block.
+	o.LeafNode.TLSConfig = config.Clone()
+	checkWarnReported(t, o, leafnodeTLSInsecureWarning)
+
+	// Now remove remote and check warning still reported
+	o.LeafNode.Remotes = nil
+	checkWarnReported(t, o, leafnodeTLSInsecureWarning)
+
+	// Remove the LN setting
+	o.LeafNode.Port = 0
+	o.LeafNode.TLSConfig = nil
+
+	// Configure GW with no TLS in main block first, but only with remotes
 	o.Gateway.Name = "A"
 	o.Gateway.Host = "127.0.0.1"
 	o.Gateway.Port = -1
-	o.Gateway.TLSConfig = gwConfig
-	checkServerFails(t, o)
-
-	// Get a config for the remote gateway
-	rgwConfig := gwConfig.Clone()
-	gurl, _ := url.Parse("nats://127.0.0.1:1234")
-
-	// Remove the insecure for the main gateway config
-	o.Gateway.TLSConfig.InsecureSkipVerify = false
 	o.Gateway.Gateways = []*RemoteGatewayOpts{
-		&RemoteGatewayOpts{
+		{
 			Name:      "B",
-			URLs:      []*url.URL{gurl},
-			TLSConfig: rgwConfig,
+			URLs:      []*url.URL{rurl},
+			TLSConfig: config.Clone(),
 		},
 	}
-	checkServerFails(t, o)
+	checkWarnReported(t, o, gatewayTLSInsecureWarning)
+
+	// Now add to main block.
+	o.Gateway.TLSConfig = config.Clone()
+	checkWarnReported(t, o, gatewayTLSInsecureWarning)
+
+	// Now remove remote and check warning still reported
+	o.Gateway.Gateways = nil
+	checkWarnReported(t, o, gatewayTLSInsecureWarning)
+}
+
+func TestConnectErrorReports(t *testing.T) {
+	// Check that default report attempts is as expected
+	opts := DefaultOptions()
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	if ra := s.getOpts().ConnectErrorReports; ra != DEFAULT_CONNECT_ERROR_REPORTS {
+		t.Fatalf("Expected default value to be %v, got %v", DEFAULT_CONNECT_ERROR_REPORTS, ra)
+	}
+
+	tmpFile, err := ioutil.TempFile("", "")
+	if err != nil {
+		t.Fatalf("Error creating temp file: %v", err)
+	}
+	log := tmpFile.Name()
+	tmpFile.Close()
+	defer os.Remove(log)
+
+	remoteURLs := RoutesFromStr("nats://127.0.0.1:1234")
+
+	opts = DefaultOptions()
+	opts.ConnectErrorReports = 3
+	opts.Cluster.Port = -1
+	opts.Routes = remoteURLs
+	opts.NoLog = false
+	opts.LogFile = log
+	opts.Logtime = true
+	opts.Debug = true
+	s = RunServer(opts)
+	defer s.Shutdown()
+
+	// Wait long enough for the number of recurring attempts to happen
+	time.Sleep(10 * routeConnectDelay)
+	s.Shutdown()
+
+	content, err := ioutil.ReadFile(log)
+	if err != nil {
+		t.Fatalf("Error reading log file: %v", err)
+	}
+
+	checkContent := func(t *testing.T, txt string, attempt int, shouldBeThere bool) {
+		t.Helper()
+		present := bytes.Contains(content, []byte(fmt.Sprintf("%s (attempt %d)", txt, attempt)))
+		if shouldBeThere && !present {
+			t.Fatalf("Did not find expected log statement (%s) for attempt %d: %s", txt, attempt, content)
+		} else if !shouldBeThere && present {
+			t.Fatalf("Log statement (%s) for attempt %d should not be present: %s", txt, attempt, content)
+		}
+	}
+
+	type testConnect struct {
+		name        string
+		attempt     int
+		errExpected bool
+	}
+	for _, test := range []testConnect{
+		{"route_attempt_1", 1, true},
+		{"route_attempt_2", 2, false},
+		{"route_attempt_3", 3, true},
+		{"route_attempt_4", 4, false},
+		{"route_attempt_6", 6, true},
+		{"route_attempt_7", 7, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			debugExpected := !test.errExpected
+			checkContent(t, "[DBG] Error trying to connect to route", test.attempt, debugExpected)
+			checkContent(t, "[ERR] Error trying to connect to route", test.attempt, test.errExpected)
+		})
+	}
+
+	os.Remove(log)
+
+	// Now try with leaf nodes
+	opts.Cluster.Port = 0
+	opts.Routes = nil
+	opts.LeafNode.Remotes = []*RemoteLeafOpts{&RemoteLeafOpts{URLs: []*url.URL{remoteURLs[0]}}}
+	opts.LeafNode.ReconnectInterval = 15 * time.Millisecond
+	s = RunServer(opts)
+	defer s.Shutdown()
+
+	// Wait long enough for the number of recurring attempts to happen
+	time.Sleep(10 * opts.LeafNode.ReconnectInterval)
+	s.Shutdown()
+
+	content, err = ioutil.ReadFile(log)
+	if err != nil {
+		t.Fatalf("Error reading log file: %v", err)
+	}
+
+	checkLeafContent := func(t *testing.T, txt, host string, attempt int, shouldBeThere bool) {
+		t.Helper()
+		present := bytes.Contains(content, []byte(fmt.Sprintf("%s %q (attempt %d)", txt, host, attempt)))
+		if shouldBeThere && !present {
+			t.Fatalf("Did not find expected log statement (%s %q) for attempt %d: %s", txt, host, attempt, content)
+		} else if !shouldBeThere && present {
+			t.Fatalf("Log statement (%s %q) for attempt %d should not be present: %s", txt, host, attempt, content)
+		}
+	}
+
+	for _, test := range []testConnect{
+		{"leafnode_attempt_1", 1, true},
+		{"leafnode_attempt_2", 2, false},
+		{"leafnode_attempt_3", 3, true},
+		{"leafnode_attempt_4", 4, false},
+		{"leafnode_attempt_6", 6, true},
+		{"leafnode_attempt_7", 7, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			debugExpected := !test.errExpected
+			checkLeafContent(t, "[DBG] Error trying to connect as leafnode to remote server", remoteURLs[0].Host, test.attempt, debugExpected)
+			checkLeafContent(t, "[ERR] Error trying to connect as leafnode to remote server", remoteURLs[0].Host, test.attempt, test.errExpected)
+		})
+	}
+
+	os.Remove(log)
+
+	// Now try with gateways
+	opts.LeafNode.Remotes = nil
+	opts.Gateway.Name = "A"
+	opts.Gateway.Port = -1
+	opts.Gateway.Gateways = []*RemoteGatewayOpts{
+		&RemoteGatewayOpts{
+			Name: "B",
+			URLs: remoteURLs,
+		},
+	}
+	opts.gatewaysSolicitDelay = 15 * time.Millisecond
+	s = RunServer(opts)
+	defer s.Shutdown()
+
+	// Wait long enough for the number of recurring attempts to happen
+	time.Sleep(10 * gatewayConnectDelay)
+	s.Shutdown()
+
+	content, err = ioutil.ReadFile(log)
+	if err != nil {
+		t.Fatalf("Error reading log file: %v", err)
+	}
+
+	for _, test := range []testConnect{
+		{"gateway_attempt_1", 1, true},
+		{"gateway_attempt_2", 2, false},
+		{"gateway_attempt_3", 3, true},
+		{"gateway_attempt_4", 4, false},
+		{"gateway_attempt_6", 6, true},
+		{"gateway_attempt_7", 7, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			debugExpected := !test.errExpected
+			infoExpected := test.errExpected
+			// For gateways, we also check our notice that we attempt to connect
+			checkContent(t, "[DBG] Connecting to explicit gateway \"B\" (127.0.0.1:1234) at 127.0.0.1:1234", test.attempt, debugExpected)
+			checkContent(t, "[INF] Connecting to explicit gateway \"B\" (127.0.0.1:1234) at 127.0.0.1:1234", test.attempt, infoExpected)
+			checkContent(t, "[DBG] Error connecting to explicit gateway \"B\" (127.0.0.1:1234) at 127.0.0.1:1234", test.attempt, debugExpected)
+			checkContent(t, "[ERR] Error connecting to explicit gateway \"B\" (127.0.0.1:1234) at 127.0.0.1:1234", test.attempt, test.errExpected)
+		})
+	}
+}
+
+func TestReconnectErrorReports(t *testing.T) {
+	// Check that default report attempts is as expected
+	opts := DefaultOptions()
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	if ra := s.getOpts().ReconnectErrorReports; ra != DEFAULT_RECONNECT_ERROR_REPORTS {
+		t.Fatalf("Expected default value to be %v, got %v", DEFAULT_RECONNECT_ERROR_REPORTS, ra)
+	}
+
+	tmpFile, err := ioutil.TempFile("", "")
+	if err != nil {
+		t.Fatalf("Error creating temp file: %v", err)
+	}
+	log := tmpFile.Name()
+	tmpFile.Close()
+	defer os.Remove(log)
+
+	csOpts := DefaultOptions()
+	csOpts.Cluster.Port = -1
+	cs := RunServer(csOpts)
+	defer cs.Shutdown()
+
+	opts = DefaultOptions()
+	opts.ReconnectErrorReports = 3
+	opts.Cluster.Port = -1
+	opts.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", cs.ClusterAddr().Port))
+	opts.NoLog = false
+	opts.LogFile = log
+	opts.Logtime = true
+	opts.Debug = true
+	s = RunServer(opts)
+	defer s.Shutdown()
+
+	// Wait for cluster to be formed
+	checkClusterFormed(t, s, cs)
+
+	// Now shutdown the server s connected to.
+	cs.Shutdown()
+
+	// Wait long enough for the number of recurring attempts to happen
+	time.Sleep(DEFAULT_ROUTE_RECONNECT + 15*routeConnectDelay)
+	s.Shutdown()
+
+	content, err := ioutil.ReadFile(log)
+	if err != nil {
+		t.Fatalf("Error reading log file: %v", err)
+	}
+
+	checkContent := func(t *testing.T, txt string, attempt int, shouldBeThere bool) {
+		t.Helper()
+		present := bytes.Contains(content, []byte(fmt.Sprintf("%s (attempt %d)", txt, attempt)))
+		if shouldBeThere && !present {
+			t.Fatalf("Did not find expected log statement (%s) for attempt %d: %s", txt, attempt, content)
+		} else if !shouldBeThere && present {
+			t.Fatalf("Log statement (%s) for attempt %d should not be present: %s", txt, attempt, content)
+		}
+	}
+
+	type testConnect struct {
+		name        string
+		attempt     int
+		errExpected bool
+	}
+	for _, test := range []testConnect{
+		{"route_attempt_1", 1, true},
+		{"route_attempt_2", 2, false},
+		{"route_attempt_3", 3, true},
+		{"route_attempt_4", 4, false},
+		{"route_attempt_6", 6, true},
+		{"route_attempt_7", 7, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			debugExpected := !test.errExpected
+			checkContent(t, "[DBG] Error trying to connect to route", test.attempt, debugExpected)
+			checkContent(t, "[ERR] Error trying to connect to route", test.attempt, test.errExpected)
+		})
+	}
+
+	os.Remove(log)
+
+	// Now try with leaf nodes
+	csOpts.Cluster.Port = 0
+	csOpts.LeafNode.Host = "127.0.0.1"
+	csOpts.LeafNode.Port = -1
+
+	cs = RunServer(csOpts)
+	defer cs.Shutdown()
+
+	opts.Cluster.Port = 0
+	opts.Routes = nil
+	u, _ := url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", csOpts.LeafNode.Port))
+	opts.LeafNode.Remotes = []*RemoteLeafOpts{&RemoteLeafOpts{URLs: []*url.URL{u}}}
+	opts.LeafNode.ReconnectInterval = 15 * time.Millisecond
+	s = RunServer(opts)
+	defer s.Shutdown()
+
+	checkFor(t, 3*time.Second, 10*time.Millisecond, func() error {
+		if nln := s.NumLeafNodes(); nln != 1 {
+			return fmt.Errorf("Number of leaf nodes is %d", nln)
+		}
+		return nil
+	})
+
+	// Now shutdown the server s is connected to
+	cs.Shutdown()
+
+	// Wait long enough for the number of recurring attempts to happen
+	time.Sleep(opts.LeafNode.ReconnectInterval + 15*opts.LeafNode.ReconnectInterval)
+	s.Shutdown()
+
+	content, err = ioutil.ReadFile(log)
+	if err != nil {
+		t.Fatalf("Error reading log file: %v", err)
+	}
+
+	checkLeafContent := func(t *testing.T, txt, host string, attempt int, shouldBeThere bool) {
+		t.Helper()
+		present := bytes.Contains(content, []byte(fmt.Sprintf("%s %q (attempt %d)", txt, host, attempt)))
+		if shouldBeThere && !present {
+			t.Fatalf("Did not find expected log statement (%s %q) for attempt %d: %s", txt, host, attempt, content)
+		} else if !shouldBeThere && present {
+			t.Fatalf("Log statement (%s %q) for attempt %d should not be present: %s", txt, host, attempt, content)
+		}
+	}
+
+	for _, test := range []testConnect{
+		{"leafnode_attempt_1", 1, true},
+		{"leafnode_attempt_2", 2, false},
+		{"leafnode_attempt_3", 3, true},
+		{"leafnode_attempt_4", 4, false},
+		{"leafnode_attempt_6", 6, true},
+		{"leafnode_attempt_7", 7, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			debugExpected := !test.errExpected
+			checkLeafContent(t, "[DBG] Error trying to connect as leafnode to remote server", u.Host, test.attempt, debugExpected)
+			checkLeafContent(t, "[ERR] Error trying to connect as leafnode to remote server", u.Host, test.attempt, test.errExpected)
+		})
+	}
+
+	os.Remove(log)
+
+	// Now try with gateways
+	csOpts.LeafNode.Port = 0
+	csOpts.Gateway.Name = "B"
+	csOpts.Gateway.Port = -1
+	cs = RunServer(csOpts)
+
+	opts.LeafNode.Remotes = nil
+	opts.Gateway.Name = "A"
+	opts.Gateway.Port = -1
+	remoteGWPort := cs.GatewayAddr().Port
+	u, _ = url.Parse(fmt.Sprintf("nats://127.0.0.1:%d", remoteGWPort))
+	opts.Gateway.Gateways = []*RemoteGatewayOpts{
+		&RemoteGatewayOpts{
+			Name: "B",
+			URLs: []*url.URL{u},
+		},
+	}
+	opts.gatewaysSolicitDelay = 15 * time.Millisecond
+	s = RunServer(opts)
+	defer s.Shutdown()
+
+	waitForOutboundGateways(t, s, 1, 2*time.Second)
+	waitForInboundGateways(t, s, 1, 2*time.Second)
+
+	// Now stop server s is connecting to
+	cs.Shutdown()
+
+	// Wait long enough for the number of recurring attempts to happen
+	time.Sleep(2*gatewayReconnectDelay + 15*gatewayConnectDelay)
+	s.Shutdown()
+
+	content, err = ioutil.ReadFile(log)
+	if err != nil {
+		t.Fatalf("Error reading log file: %v", err)
+	}
+
+	connTxt := fmt.Sprintf("Connecting to explicit gateway \"B\" (127.0.0.1:%d) at 127.0.0.1:%d", remoteGWPort, remoteGWPort)
+	dbgConnTxt := fmt.Sprintf("[DBG] %s", connTxt)
+	infConnTxt := fmt.Sprintf("[INF] %s", connTxt)
+
+	errTxt := fmt.Sprintf("Error connecting to explicit gateway \"B\" (127.0.0.1:%d) at 127.0.0.1:%d", remoteGWPort, remoteGWPort)
+	dbgErrTxt := fmt.Sprintf("[DBG] %s", errTxt)
+	errErrTxt := fmt.Sprintf("[ERR] %s", errTxt)
+
+	for _, test := range []testConnect{
+		{"gateway_attempt_1", 1, true},
+		{"gateway_attempt_2", 2, false},
+		{"gateway_attempt_3", 3, true},
+		{"gateway_attempt_4", 4, false},
+		{"gateway_attempt_6", 6, true},
+		{"gateway_attempt_7", 7, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			debugExpected := !test.errExpected
+			infoExpected := test.errExpected
+			// For gateways, we also check our notice that we attempt to connect
+			checkContent(t, dbgConnTxt, test.attempt, debugExpected)
+			checkContent(t, infConnTxt, test.attempt, infoExpected)
+			checkContent(t, dbgErrTxt, test.attempt, debugExpected)
+			checkContent(t, errErrTxt, test.attempt, test.errExpected)
+		})
+	}
 }
