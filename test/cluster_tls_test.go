@@ -52,14 +52,14 @@ func TestBasicTLSClusterPubSub(t *testing.T) {
 	sendA("PING\r\n")
 	expectA(pongRe)
 
+	if err := checkExpectedSubs(1, srvA, srvB); err != nil {
+		t.Fatalf("%v", err)
+	}
+
 	sendB, expectB := setupConn(t, clientB)
 	sendB("PUB foo 2\r\nok\r\n")
 	sendB("PING\r\n")
 	expectB(pongRe)
-
-	if err := checkExpectedSubs(1, srvA, srvB); err != nil {
-		t.Fatalf("%v", err)
-	}
 
 	expectMsgs := expectMsgsCommand(t, expectA)
 
@@ -101,6 +101,7 @@ func TestClusterTLSInsecure(t *testing.T) {
 	confA := createConfFile(t, []byte(`
 		port: -1
 		cluster {
+			name: "xyz"
 			listen: "127.0.0.1:-1"
 			tls {
 			    cert_file: "./configs/certs/server-noip.pem"
@@ -119,6 +120,7 @@ func TestClusterTLSInsecure(t *testing.T) {
 	bConfigTemplate := `
 		port: -1
 		cluster {
+			name: "xyz"
 			listen: "127.0.0.1:-1"
 			tls {
 			    cert_file: "./configs/certs/server-noip.pem"

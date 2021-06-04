@@ -22,20 +22,28 @@ builds:
   - darwin
   - linux
   - windows
+  - freebsd
   goarch:
   - amd64
   - arm
   - arm64
   - 386
+  - mips64le
   goarm:
   - 6
   - 7
   ignore:
     - goos: darwin
       goarch: 386
+    - goos: freebsd
+      goarch: arm
+    - goos: freebsd
+      goarch: arm64
+    - goos: freebsd
+      goarch: 386
 
 nfpms:
-  - name_template: '{{.ProjectName}}-{{.Tag}}-{{.Arch}}{{if .Arm}}{{.Arm}}{{end}}'
+  - file_name_template: '{{.ProjectName}}-{{.Tag}}-{{.Arch}}{{if .Arm}}{{.Arm}}{{end}}'
     homepage:  https://nats.io
     description: High-Performance server for NATS, the cloud native messaging system.
     maintainer: Ivan Kozlovic <ivan@synadia.com>
@@ -49,6 +57,13 @@ archives:
   - name_template: '{{.ProjectName}}-{{.Tag}}-{{.Os}}-{{.Arch}}{{if .Arm}}{{.Arm}}{{end}}'
     wrap_in_directory: true
     format: zip
+    files:
+      - README.md
+      - LICENSE
+  - name_template: '{{.ProjectName}}-{{.Tag}}-{{.Os}}-{{.Arch}}{{if .Arm}}{{.Arm}}{{end}}'
+    id: targz-archives
+    wrap_in_directory: true
+    format: tar.gz
     files:
       - README.md
       - LICENSE

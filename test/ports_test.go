@@ -46,7 +46,7 @@ func portFile(dirname string) string {
 }
 
 func TestPortsFile(t *testing.T) {
-	portFileDir := os.TempDir()
+	portFileDir := createDir(t, "")
 
 	opts := DefaultTestOptions
 	opts.PortsFileDir = portFileDir
@@ -54,6 +54,12 @@ func TestPortsFile(t *testing.T) {
 	opts.HTTPPort = -1
 	opts.ProfPort = -1
 	opts.Cluster.Port = -1
+	opts.Websocket.Port = -1
+	tc := &server.TLSConfigOpts{
+		CertFile: "./configs/certs/server-cert.pem",
+		KeyFile:  "./configs/certs/server-key.pem",
+	}
+	opts.Websocket.TLSConfig, _ = server.GenTLSConfig(tc)
 
 	s := RunServer(&opts)
 	// this for test cleanup in case we fail - will be ignored if server already shutdown
@@ -100,6 +106,10 @@ func TestPortsFile(t *testing.T) {
 		t.Fatal("Expected at least one profile listen url")
 	}
 
+	if len(readPorts.WebSocket) == 0 || !strings.HasPrefix(readPorts.WebSocket[0], "wss://") {
+		t.Fatal("Expected at least one ws listen url")
+	}
+
 	// testing cleanup
 	s.Shutdown()
 	// if we called shutdown, the cleanup code should have kicked
@@ -114,11 +124,8 @@ func TestPortsFile(t *testing.T) {
 // the location of the ports file is changed from dir A to dir B.
 func TestPortsFileReload(t *testing.T) {
 	// make a temp dir
-	tempDir, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatalf("Error creating temp director (%s): %v", tempDir, err)
-	}
-	defer os.RemoveAll(tempDir)
+	tempDir := createDir(t, "")
+	defer removeDir(t, tempDir)
 
 	// make child temp dir A
 	dirA := filepath.Join(tempDir, "A")

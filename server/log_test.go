@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/nats-io/nats-server/v2/logger"
 )
@@ -143,8 +144,8 @@ func TestReOpenLogFile(t *testing.T) {
 
 	// Set a File log
 	s.opts.LogFile = "test.log"
-	defer os.Remove(s.opts.LogFile)
-	defer os.Remove(s.opts.LogFile + ".bak")
+	defer removeFile(t, s.opts.LogFile)
+	defer removeFile(t, s.opts.LogFile+".bak")
 	fileLog := logger.NewFileLogger(s.opts.LogFile, s.opts.Logtime, s.opts.Debug, s.opts.Trace, true)
 	s.SetLogger(fileLog, false, false)
 	// Add some log
@@ -183,13 +184,68 @@ func TestReOpenLogFile(t *testing.T) {
 	}
 }
 
+func TestFileLoggerSizeLimitAndReopen(t *testing.T) {
+	s := &Server{opts: &Options{}}
+	defer s.SetLogger(nil, false, false)
+
+	tmpDir := createDir(t, "nats-server")
+	defer removeDir(t, tmpDir)
+	file := createFileAtDir(t, tmpDir, "log_")
+	file.Close()
+
+	// Set a File log
+	s.opts.LogFile = file.Name()
+	s.opts.Logtime = true
+	s.opts.LogSizeLimit = 1000
+	s.ConfigureLogger()
+
+	// Add a trace
+	s.Noticef("this is a notice")
+
+	// Do a re-open...
+	s.ReOpenLogFile()
+
+	// Content should indicate that we have re-opened the log
+	buf, err := ioutil.ReadFile(s.opts.LogFile)
+	if err != nil {
+		t.Fatalf("Error reading file: %v", err)
+	}
+	if strings.HasSuffix(string(buf), "File log-reopened") {
+		t.Fatalf("File should indicate that file log was re-opened, got: %v", string(buf))
+	}
+
+	// Now make sure that the limit is still honored.
+	txt := make([]byte, 800)
+	for i := 0; i < len(txt); i++ {
+		txt[i] = 'A'
+	}
+	s.Noticef(string(txt))
+	for i := 0; i < len(txt); i++ {
+		txt[i] = 'B'
+	}
+	s.Noticef(string(txt))
+
+	buf, err = ioutil.ReadFile(s.opts.LogFile)
+	if err != nil {
+		t.Fatalf("Error reading file: %v", err)
+	}
+	sbuf := string(buf)
+	if strings.Contains(sbuf, "AAAAA") || strings.Contains(sbuf, "BBBBB") {
+		t.Fatalf("Looks like file was not rotated: %s", sbuf)
+	}
+	if !strings.Contains(sbuf, "Rotated log, backup saved") {
+		t.Fatalf("File should have been rotated, was not: %s", sbuf)
+	}
+}
+
 func TestNoPasswordsFromConnectTrace(t *testing.T) {
 	opts := DefaultOptions()
 	opts.NoLog = false
 	opts.Trace = true
 	opts.Username = "derek"
 	opts.Password = "s3cr3t"
-
+	opts.PingInterval = 2 * time.Minute
+	setBaselineOptions(opts)
 	s := &Server{opts: opts}
 	dl := &DummyLogger{}
 	s.SetLogger(dl, false, true)
@@ -201,6 +257,7 @@ func TestNoPasswordsFromConnectTrace(t *testing.T) {
 	defer s.SetLogger(nil, false, false)
 
 	c, _, _ := newClientForServer(s)
+	defer c.close()
 
 	connectOp := []byte("CONNECT {\"user\":\"derek\",\"pass\":\"s3cr3t\"}\r\n")
 	err := c.parse(connectOp)

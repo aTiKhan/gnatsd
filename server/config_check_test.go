@@ -16,7 +16,6 @@ package server
 import (
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 )
@@ -359,6 +358,19 @@ func TestConfigCheck(t *testing.T) {
 			err:       errors.New(`unrecognized curve preference CurveP5210000`),
 			errorLine: 4,
 			errorPos:  5,
+		},
+		{
+			name: "verify_cert_and_check_known_urls not support for clients",
+			config: `
+		tls = {
+						cert_file: "configs/certs/server.pem"
+						key_file: "configs/certs/key.pem"
+					    verify_cert_and_check_known_urls: true
+		}
+		`,
+			err:       errors.New("verify_cert_and_check_known_urls not supported in this context"),
+			errorLine: 5,
+			errorPos:  10,
 		},
 		{
 			name: "when unknown option is in cluster config with defined routes",
@@ -1090,11 +1102,38 @@ func TestConfigCheck(t *testing.T) {
 		{
 			name: "invalid lame_duck_duration type",
 			config: `
-		lame_duck_duration: abc
+				lame_duck_duration: abc
 			`,
-			err:       errors.New(`error parsing lame_duck_duration: time: invalid duration abc`),
+			err:       errors.New(`error parsing lame_duck_duration: time: invalid duration`),
 			errorLine: 2,
-			errorPos:  3,
+			errorPos:  5,
+		},
+		{
+			name: "lame_duck_duration too small",
+			config: `
+				lame_duck_duration: "5s"
+			`,
+			err:       errors.New(`invalid lame_duck_duration of 5s, minimum is 30 seconds`),
+			errorLine: 2,
+			errorPos:  5,
+		},
+		{
+			name: "invalid lame_duck_grace_period type",
+			config: `
+				lame_duck_grace_period: abc
+			`,
+			err:       errors.New(`error parsing lame_duck_grace_period: time: invalid duration`),
+			errorLine: 2,
+			errorPos:  5,
+		},
+		{
+			name: "lame_duck_grace_period should be positive",
+			config: `
+				lame_duck_grace_period: "-5s"
+			`,
+			err:       errors.New(`invalid lame_duck_grace_period, needs to be positive`),
+			errorLine: 2,
+			errorPos:  5,
 		},
 		{
 			name: "when only setting TLS timeout for a leafnode remote",
@@ -1102,7 +1141,7 @@ func TestConfigCheck(t *testing.T) {
 		leafnodes {
 		  remotes = [
 		    {
-		      url: "tls://connect.ngs.global:7422"
+		      url: "tls://nats:7422"
 		      tls {
 		        timeout: 0.01
 		      }
@@ -1114,30 +1153,47 @@ func TestConfigCheck(t *testing.T) {
 			errorPos:  0,
 		},
 		{
-			name: "when setting latency tracking without a system account",
+			name: "verify_cert_and_check_known_urls do not work for leaf nodes",
 			config: `
-                accounts {
-                  sys { users = [ {user: sys, pass: "" } ] }
-
-                  nats.io: {
-                    users = [ { user : bar, pass: "" } ]
-
-                    exports = [
-                      { service: "nats.add"
-                        response: singleton
-                        latency: {
-                          sampling: 100%
-                          subject: "latency.tracking.add"
-                        }
-                      }
-
-                    ]
-                  }
-                }
-                `,
-			err:       errors.New(`Error adding service latency sampling for "nats.add": system account not setup`),
-			errorLine: 2,
-			errorPos:  17,
+		leafnodes {
+		  remotes = [
+		    {
+		      url: "tls://nats:7422"
+		      tls {
+		        timeout: 0.01
+				verify_cert_and_check_known_urls: true
+		      }
+		    }
+		  ]
+		}`,
+			//Unexpected error after processing config: /var/folders/9h/6g_c9l6n6bb8gp331d_9y0_w0000gn/T/057996446:8:5:
+			err:       errors.New("verify_cert_and_check_known_urls not supported in this context"),
+			errorLine: 8,
+			errorPos:  5,
+		},
+		{
+			name: "when leafnode remotes use wrong type",
+			config: `
+		leafnodes {
+		  remotes: {
+  	            url: "tls://nats:7422"
+		  }
+		}`,
+			err:       errors.New(`Expected remotes field to be an array, got map[string]interface {}`),
+			errorLine: 3,
+			errorPos:  5,
+		},
+		{
+			name: "when leafnode remotes url uses wrong type",
+			config: `
+		leafnodes {
+		  remotes: [
+  	            { urls: 1234 }
+		  ]
+		}`,
+			err:       errors.New(`Expected remote leafnode url to be an array or string, got 1234`),
+			errorLine: 4,
+			errorPos:  18,
 		},
 		{
 			name: "when setting latency tracking with a system account",
@@ -1244,28 +1300,179 @@ func TestConfigCheck(t *testing.T) {
                      user: user1
                      password: pwd
                      users = [{user: user2, password: pwd}]
-									 }
-								}
+                   }
+                }
               `,
 			err:       errors.New("can not have a single user/pass and a users array"),
 			errorLine: 3,
 			errorPos:  20,
 		},
 		{
-			name: "dulpicate usernames in leafnode authorization",
+			name: "duplicate usernames in leafnode authorization",
 			config: `
                 leafnodes {
-                   authorization {
-                     users = [
-                       {user: user, password: pwd}
-											 {user: user, password: pwd}
-                     ]
-									 }
-								}
+                    authorization {
+                        users = [
+                            {user: user, password: pwd}
+                            {user: user, password: pwd}
+                        ]
+                    }
+                }
               `,
 			err:       errors.New(`duplicate user "user" detected in leafnode authorization`),
 			errorLine: 3,
-			errorPos:  20,
+			errorPos:  21,
+		},
+		{
+			name: "mqtt bad type",
+			config: `
+                mqtt [
+					"wrong"
+				]
+			`,
+			err:       errors.New(`Expected mqtt to be a map, got []interface {}`),
+			errorLine: 2,
+			errorPos:  17,
+		},
+		{
+			name: "mqtt bad listen",
+			config: `
+                mqtt {
+                    listen: "xxxxxxxx"
+				}
+			`,
+			err:       errors.New(`could not parse address string "xxxxxxxx"`),
+			errorLine: 3,
+			errorPos:  21,
+		},
+		{
+			name: "mqtt bad host",
+			config: `
+                mqtt {
+                    host: 1234
+				}
+			`,
+			err:       errors.New(`interface conversion: interface {} is int64, not string`),
+			errorLine: 3,
+			errorPos:  21,
+		},
+		{
+			name: "mqtt bad port",
+			config: `
+                mqtt {
+                    port: "abc"
+				}
+			`,
+			err:       errors.New(`interface conversion: interface {} is string, not int64`),
+			errorLine: 3,
+			errorPos:  21,
+		},
+		{
+			name: "mqtt bad TLS",
+			config: `
+                mqtt {
+					port: -1
+                    tls {
+                        cert_file: "./configs/certs/server.pem"
+					}
+				}
+			`,
+			err:       errors.New(`missing 'key_file' in TLS configuration`),
+			errorLine: 4,
+			errorPos:  21,
+		},
+		{
+			name: "connection types wrong type",
+			config: `
+                   authorization {
+                       users [
+                           {user: a, password: pwd, allowed_connection_types: 123}
+					   ]
+				   }
+			`,
+			err:       errors.New(`error parsing allowed connection types: unsupported type int64`),
+			errorLine: 4,
+			errorPos:  53,
+		},
+		{
+			name: "connection types content wrong type",
+			config: `
+                   authorization {
+                       users [
+                           {user: a, password: pwd, allowed_connection_types: [
+                               123
+                               WEBSOCKET
+							]}
+					   ]
+				   }
+			`,
+			err:       errors.New(`error parsing allowed connection types: unsupported type in array int64`),
+			errorLine: 5,
+			errorPos:  32,
+		},
+		{
+			name: "connection types type unknown",
+			config: `
+                   authorization {
+                       users [
+                           {user: a, password: pwd, allowed_connection_types: [ "UNKNOWN" ]}
+					   ]
+				   }
+			`,
+			err:       fmt.Errorf("invalid connection types [%q]", "UNKNOWN"),
+			errorLine: 4,
+			errorPos:  53,
+		},
+		{
+			name: "websocket auth unknown var",
+			config: `
+				websocket {
+					authorization {
+                        unknown: "field"
+				   }
+				}
+			`,
+			err:       fmt.Errorf("unknown field %q", "unknown"),
+			errorLine: 4,
+			errorPos:  25,
+		},
+		{
+			name: "websocket bad tls",
+			config: `
+				websocket {
+                    tls {
+						cert_file: "configs/certs/server.pem"
+					}
+				}
+			`,
+			err:       fmt.Errorf("missing 'key_file' in TLS configuration"),
+			errorLine: 3,
+			errorPos:  21,
+		},
+		{
+			name: "verify_cert_and_check_known_urls not support for websockets",
+			config: `
+				websocket {
+                    tls {
+						cert_file: "configs/certs/server.pem"
+						key_file: "configs/certs/key.pem"
+					    verify_cert_and_check_known_urls: true
+					}
+				}
+			`,
+			err:       fmt.Errorf("verify_cert_and_check_known_urls not supported in this context"),
+			errorLine: 6,
+			errorPos:  10,
+		},
+		{
+			name: "ambiguous store dir",
+			config: `
+                                store_dir: "foo"
+                                jetstream {
+                                  store_dir: "bar"
+                                }
+                        `,
+			err: fmt.Errorf(`Duplicate 'store_dir' configuration`),
 		},
 	}
 
@@ -1290,7 +1497,7 @@ func TestConfigCheck(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			conf := createConfFile(t, []byte(test.config))
-			defer os.Remove(conf)
+			defer removeFile(t, conf)
 			err := checkConfig(conf)
 			var expectedErr error
 
@@ -1302,12 +1509,18 @@ func TestConfigCheck(t *testing.T) {
 			}
 
 			if err != nil && expectedErr != nil {
-				msg := fmt.Sprintf("%s:%d:%d: %s", conf, test.errorLine, test.errorPos, expectedErr.Error())
-				if test.reason != "" {
-					msg += ": " + test.reason
+				var msg string
+
+				if test.errorPos > 0 {
+					msg = fmt.Sprintf("%s:%d:%d: %s", conf, test.errorLine, test.errorPos, expectedErr.Error())
+					if test.reason != "" {
+						msg += ": " + test.reason
+					}
+				} else {
+					msg = test.reason
 				}
-				msg += "\n"
-				if err.Error() != msg {
+
+				if !strings.Contains(err.Error(), msg) {
 					t.Errorf("Expected:\n%q\ngot:\n%q", msg, err.Error())
 				}
 			}
@@ -1334,9 +1547,9 @@ func TestConfigCheckIncludes(t *testing.T) {
 	if err == nil {
 		t.Errorf("Expected error processing include files with configuration check enabled: %v", err)
 	}
-	expectedErr := errors.New(`configs/include_bad_conf_check_b.conf:10:19: unknown field "monitoring_port"` + "\n")
-	if err != nil && expectedErr != nil && err.Error() != expectedErr.Error() {
-		t.Errorf("Expected: \n%q, got\n: %q", expectedErr.Error(), err.Error())
+	expectedErr := `include_bad_conf_check_b.conf:10:19: unknown field "monitoring_port"` + "\n"
+	if err != nil && !strings.HasSuffix(err.Error(), expectedErr) {
+		t.Errorf("Expected: \n%q, got\n: %q", expectedErr, err.Error())
 	}
 }
 

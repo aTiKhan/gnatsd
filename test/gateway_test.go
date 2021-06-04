@@ -16,17 +16,23 @@ package test
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"net"
+	"net/url"
 	"regexp"
 	"testing"
+	"time"
 
 	"github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats.go"
 )
 
 func testDefaultOptionsForGateway(name string) *server.Options {
 	o := DefaultTestOptions
 	o.Port = -1
+	o.Cluster.Name = name
 	o.Gateway.Name = name
 	o.Gateway.Host = "127.0.0.1"
 	o.Gateway.Port = -1
@@ -56,14 +62,22 @@ func setupGatewayConn(t testing.TB, c net.Conn, org, dst string) (sendFun, expec
 	return sendCommand(t, c), expectCommand(t, c)
 }
 
-func expectNumberOfProtos(t *testing.T, expFn expectFun, proto *regexp.Regexp, expected int) {
+func expectNumberOfProtos(t *testing.T, expFn expectFun, proto *regexp.Regexp, expected int, ignore ...*regexp.Regexp) {
 	t.Helper()
+	buf := []byte(nil)
 	for count := 0; count != expected; {
-		buf := expFn(proto)
+		buf = append(buf, expFn(anyRe)...)
+		for _, skip := range ignore {
+			buf = skip.ReplaceAll(buf, []byte(``))
+		}
 		count += len(proto.FindAllSubmatch(buf, -1))
 		if count > expected {
 			t.Fatalf("Expected %v matches, got %v", expected, count)
 		}
+		buf = proto.ReplaceAll(buf, []byte(``))
+	}
+	if len(buf) != 0 {
+		t.Fatalf("did not consume everything, left with: %q", buf)
 	}
 }
 
@@ -514,5 +528,209 @@ func TestGatewayNoAccUnsubAfterQSub(t *testing.T) {
 	clientSend("SUB baz 2\r\nPING\r\n")
 	clientExpect(pongRe)
 
+	expectNothing(t, gA)
+}
+
+func TestGatewayErrorOnRSentFromOutbound(t *testing.T) {
+	ob := testDefaultOptionsForGateway("B")
+	sb := runGatewayServer(ob)
+	defer sb.Shutdown()
+
+	for _, test := range []struct {
+		name  string
+		proto string
+	}{
+		{"RS+", "RS+"},
+		{"RS-", "RS-"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			gA := createGatewayConn(t, ob.Gateway.Host, ob.Gateway.Port)
+			defer gA.Close()
+
+			gASend, gAExpect := setupGatewayConn(t, gA, "A", "B")
+			gASend("PING\r\n")
+			gAExpect(pongRe)
+
+			gASend(fmt.Sprintf("%s foo bar\r\n", test.proto))
+			expectDisconnect(t, gA)
+		})
+	}
+}
+
+func TestGatewaySystemConnectionAllowedToPublishOnGWPrefix(t *testing.T) {
+	sc := createSuperCluster(t, 2, 2)
+	defer sc.shutdown()
+
+	o := sc.clusters[1].opts[1]
+	url := fmt.Sprintf("nats://sys:pass@%s:%d", o.Host, o.Port)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	reply := nats.NewInbox()
+	sub, err := nc.SubscribeSync(reply)
+	if err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+	if err := nc.PublishRequest("$SYS.REQ.SERVER.PING", reply, nil); err != nil {
+		t.Fatalf("Failed to send request: %v", err)
+	}
+	for i := 0; i < 4; i++ {
+		if _, err := sub.NextMsg(time.Second); err != nil {
+			t.Fatalf("Expected to get a response, got %v", err)
+		}
+	}
+}
+
+func TestGatewayTLSMixedIPAndDNS(t *testing.T) {
+	server.SetGatewaysSolicitDelay(5 * time.Millisecond)
+	defer server.ResetGatewaysSolicitDelay()
+
+	confA1 := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		gateway {
+			name: "A"
+			listen: "127.0.0.1:-1"
+			tls {
+				cert_file: "./configs/certs/server-iponly.pem"
+				key_file:  "./configs/certs/server-key-iponly.pem"
+				ca_file:   "./configs/certs/ca.pem"
+				timeout: 2
+			}
+		}
+		cluster {
+			listen: "127.0.0.1:-1"
+		}
+	`))
+	defer removeFile(t, confA1)
+	srvA1, optsA1 := RunServerWithConfig(confA1)
+	defer srvA1.Shutdown()
+
+	confA2Template := `
+		listen: 127.0.0.1:-1
+		gateway {
+			name: "A"
+			listen: "localhost:-1"
+			tls {
+				cert_file: "./configs/certs/server-cert.pem"
+				key_file:  "./configs/certs/server-key.pem"
+				ca_file:   "./configs/certs/ca.pem"
+				timeout: 2
+			}
+		}
+		cluster {
+			listen: "127.0.0.1:-1"
+			routes [
+				"nats://%s:%d"
+			]
+		}
+	`
+	confA2 := createConfFile(t, []byte(fmt.Sprintf(confA2Template,
+		optsA1.Cluster.Host, optsA1.Cluster.Port)))
+	defer removeFile(t, confA2)
+	srvA2, optsA2 := RunServerWithConfig(confA2)
+	defer srvA2.Shutdown()
+
+	checkClusterFormed(t, srvA1, srvA2)
+
+	// Create a GW connection to cluster "A". Don't use the helper since we need verification etc.
+	o := DefaultTestOptions
+	o.Port = -1
+	o.Gateway.Name = "B"
+	o.Gateway.Host = "127.0.0.1"
+	o.Gateway.Port = -1
+
+	tc := &server.TLSConfigOpts{}
+	tc.CertFile = "./configs/certs/server-cert.pem"
+	tc.KeyFile = "./configs/certs/server-key.pem"
+	tc.CaFile = "./configs/certs/ca.pem"
+	tc.Timeout = 2.0
+	tlsConfig, err := server.GenTLSConfig(tc)
+	if err != nil {
+		t.Fatalf("Error generating TLS config: %v", err)
+	}
+	tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+	tlsConfig.RootCAs = tlsConfig.ClientCAs
+
+	o.Gateway.TLSConfig = tlsConfig.Clone()
+
+	rurl, _ := url.Parse(fmt.Sprintf("nats://%s:%d", optsA2.Gateway.Host, optsA2.Gateway.Port))
+	remote := &server.RemoteGatewayOpts{Name: "A", URLs: []*url.URL{rurl}}
+	remote.TLSConfig = tlsConfig.Clone()
+	o.Gateway.Gateways = []*server.RemoteGatewayOpts{remote}
+
+	srvB := RunServer(&o)
+	defer srvB.Shutdown()
+
+	waitForOutboundGateways(t, srvB, 1, 10*time.Second)
+	waitForOutboundGateways(t, srvA1, 1, 10*time.Second)
+	waitForOutboundGateways(t, srvA2, 1, 10*time.Second)
+
+	// Now kill off srvA2 and force serverB to connect to srvA1.
+	srvA2.Shutdown()
+
+	// Make sure this works.
+	waitForOutboundGateways(t, srvB, 1, 10*time.Second)
+}
+
+func TestGatewayAdvertiseInCluster(t *testing.T) {
+	ob1 := testDefaultOptionsForGateway("B")
+	ob1.Cluster.Name = "B"
+	ob1.Cluster.Host = "127.0.0.1"
+	ob1.Cluster.Port = -1
+	sb1 := runGatewayServer(ob1)
+	defer sb1.Shutdown()
+
+	gA := createGatewayConn(t, ob1.Gateway.Host, ob1.Gateway.Port)
+	defer gA.Close()
+
+	gASend, gAExpect := setupGatewayConn(t, gA, "A", "B")
+	gASend("PING\r\n")
+	gAExpect(pongRe)
+
+	ob2 := testDefaultOptionsForGateway("B")
+	ob2.Cluster.Name = "B"
+	ob2.Cluster.Host = "127.0.0.1"
+	ob2.Cluster.Port = -1
+	ob2.Routes = server.RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", ob1.Cluster.Port))
+	ob2.Gateway.Advertise = "srvB:7222"
+	sb2 := runGatewayServer(ob2)
+	defer sb2.Shutdown()
+
+	checkClusterFormed(t, sb1, sb2)
+
+	buf := gAExpect(infoRe)
+	si := &server.Info{}
+	json.Unmarshal(buf[5:], si)
+	var ok bool
+	for _, u := range si.GatewayURLs {
+		if u == "srvB:7222" {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		t.Fatalf("Url srvB:7222 was not found: %q", si.GatewayURLs)
+	}
+
+	ob3 := testDefaultOptionsForGateway("B")
+	ob3.Cluster.Name = "B"
+	ob3.Cluster.Host = "127.0.0.1"
+	ob3.Cluster.Port = -1
+	ob3.Routes = server.RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", ob1.Cluster.Port))
+	ob3.Gateway.Advertise = "srvB:7222"
+	sb3 := runGatewayServer(ob3)
+	defer sb3.Shutdown()
+
+	checkClusterFormed(t, sb1, sb2, sb3)
+
+	// Since it is the save srvB:7222 url, we should not get an update.
+	expectNothing(t, gA)
+
+	// Now shutdown sb2 and make sure that we are not getting an update
+	// with srvB:7222 missing.
+	sb2.Shutdown()
 	expectNothing(t, gA)
 }

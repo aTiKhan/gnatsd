@@ -13,6 +13,8 @@
 
 package main
 
+//go:generate go run server/errors_gen.go
+
 import (
 	"flag"
 	"fmt"
@@ -27,14 +29,15 @@ Usage: nats-server [options]
 Server Options:
     -a, --addr <host>                Bind to host address (default: 0.0.0.0)
     -p, --port <port>                Use port for clients (default: 4222)
+    -n, --name <server_name>         Server name (default: auto)
     -P, --pid <file>                 File to store PID
     -m, --http_port <port>           Use port for http monitoring
     -ms,--https_port <port>          Use port for https monitoring
     -c, --config <file>              Configuration file
+    -t                               Test configuration and exit
     -sl,--signal <signal>[=<pid>]    Send signal to nats-server process (stop, quit, reopen, reload)
                                      <pid> can be either a PID (e.g. 1) or the path to a PID file (e.g. /var/run/nats-server.pid)
         --client_advertise <string>  Client URL to advertise to other servers
-    -t                               Test configuration and exit
 
 Logging Options:
     -l, --log <file>                 File to redirect log output
@@ -43,7 +46,13 @@ Logging Options:
     -r, --remote_syslog <addr>       Syslog server addr (udp://localhost:514)
     -D, --debug                      Enable debugging output
     -V, --trace                      Trace the raw protocol
+    -VV                              Verbose trace (traces system account as well)
     -DV                              Debug and trace
+    -DVV                             Debug and verbose trace (traces system account as well)
+
+JetStream Options:
+    -js, --jetstream                 Enable JetStream functionality.
+    -sd, --store_dir <dir>           Set the storage directory.
 
 Authorization Options:
         --user <user>                User required for connections
@@ -60,10 +69,10 @@ TLS Options:
 Cluster Options:
         --routes <rurl-1, rurl-2>    Routes to solicit and connect
         --cluster <cluster-url>      Cluster URL for solicited routes
-        --no_advertise <bool>        Advertise known cluster IPs to clients
+        --cluster_name <string>      Cluster Name, if not set one will be dynamically generated
+        --no_advertise <bool>        Do not advertise known cluster information to clients
         --cluster_advertise <string> Cluster URL to advertise to other servers
         --connect_retries <number>   For implicit routes, number of connect retries
-
 
 Common Options:
     -h, --help                       Show this message
@@ -109,4 +118,5 @@ func main() {
 	if err := server.Run(s); err != nil {
 		server.PrintAndDie(err.Error())
 	}
+	s.WaitForShutdown()
 }
